@@ -16,7 +16,7 @@ targets:
     sources: [App]
     dependencies:
       - package: RoostrIOS
-        product: GlonCore
+        product: RoostrUI
     info:
       path: App/Info.plist
       properties:

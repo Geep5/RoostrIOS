@@ -1,0 +1,73 @@
+{
+  "secret": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+  "pubkey": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+  "npub": "npub1zsn32e6l47x6rmxy650qh8jnn7sd2t7ajmkkpklfntd3t44sttvsgg5m7h",
+  "nsec": "nsec10alh7lml0alh7lml0alh7lml0alh7lml0alh7lml0alh7lml0alsj7rpl0",
+  "selfConversationKey": "0a63397860d6d09cc0612e074a2330bde217f20d50ce7cfcc550cfefe177f327",
+  "events": [
+    {
+      "kind": 1078,
+      "created_at": 1700000000,
+      "tags": [
+        [
+          "h",
+          "0123456789abcdef"
+        ]
+      ],
+      "content": "AgAAAAAA",
+      "pubkey": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "id": "9405f6a9c800cd45ec2c986d9102ce6f829516978983e9e55801547c906bd79e",
+      "sig": "ef09e42e7ebbf1450a13eec6829a5103894449ea44df01c67fdac185bb99283653c4d8e8d7a196d4bbb3c0b3a5e5828c8a54a0efcfe0172fd282fdb6e4c53a1c"
+    },
+    {
+      "kind": 1,
+      "created_at": 1700000001,
+      "tags": [
+        [
+          "e",
+          "x"
+        ],
+        [
+          "c",
+          "gid",
+          "0",
+          "2"
+        ]
+      ],
+      "content": "unicode ✓ and \"quotes\" and \\backslash\\ and\nnewline\ttab",
+      "pubkey": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "id": "e9d1364cbc8bc1c472e1f7e49a2f099963485be359bf9130fe46fc1b70e8526a",
+      "sig": "15e17ce7b3283b21ce30845e413967b0824deb79b5f77bc687c798e5a4d4a3228f28d14f1b0fb361424703309a44ada8beeeb2b5efd2ac403c2be4e480871dc0"
+    },
+    {
+      "kind": 30100,
+      "created_at": 1700000002,
+      "tags": [
+        [
+          "d",
+          "roostr-allowlist"
+        ]
+      ],
+      "content": "",
+      "pubkey": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "id": "ebc9d461ca2c3dff790ae4630d7310b39493f67a30e2e879176a47e8ddc763d0",
+      "sig": "d071fabdcb5de3eb5c60b3d0eea29d0deeb5730c563332039c5e85f359fb9273ce7d367be0a6f135470bb6822331d145a0ff3d719948905b55e67026fcfbad9e"
+    }
+  ],
+  "invalid": [
+    {
+      "kind": 1078,
+      "created_at": 1700000000,
+      "tags": [
+        [
+          "h",
+          "0123456789abcdef"
+        ]
+      ],
+      "content": "AgAAAAAB",
+      "pubkey": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "id": "9405f6a9c800cd45ec2c986d9102ce6f829516978983e9e55801547c906bd79e",
+      "sig": "ef09e42e7ebbf1450a13eec6829a5103894449ea44df01c67fdac185bb99283653c4d8e8d7a196d4bbb3c0b3a5e5828c8a54a0efcfe0172fd282fdb6e4c53a1c"
+    }
+  ]
+}
