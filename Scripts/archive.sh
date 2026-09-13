@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Archive the iOS app and upload it to App Store Connect (TestFlight).
 #
-#   ROOSTR_TEAM_ID=ABCDE12345 Scripts/archive.sh            # archive + export .ipa
-#   ROOSTR_TEAM_ID=ABCDE12345 Scripts/archive.sh --upload   # …and upload to App Store Connect
+#   Scripts/archive.sh            # archive + export .ipa
+#   Scripts/archive.sh --upload   # …and upload to App Store Connect
 #
 # Requires: Xcode signed in to the developer account (Xcode > Settings >
 # Accounts) so automatic signing can create certificates and profiles
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-: "${ROOSTR_TEAM_ID:?set ROOSTR_TEAM_ID to your Apple Developer Team ID}"
+ROOSTR_TEAM_ID="${ROOSTR_TEAM_ID:-58GKGS43UM}"
 out="${ROOSTR_ARCHIVE_DIR:-$root/.build/archive}"
 archive="$out/Roostr.xcarchive"
 mkdir -p "$out"

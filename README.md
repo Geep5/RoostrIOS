@@ -88,7 +88,6 @@ xcrun simctl launch 'iPhone 17' app.roostr.Roostr      # SIMCTL_CHILD_ROOSTR_IDE
 
 ```sh
 # once: Xcode > Settings > Accounts > sign in with the developer Apple ID
-export ROOSTR_TEAM_ID=ABCDE12345           # Team ID from developer.apple.com/account
 Scripts/build-web.sh                       # bundle the current website
 Scripts/archive.sh --upload                # archive (Release, generic iOS), export, upload to App Store Connect
 ```

@@ -1,9 +1,8 @@
 # XcodeGen spec for the app shell: `brew install xcodegen && xcodegen` writes
 # Roostr.xcodeproj (gitignored). The engine bridge is the local Swift package.
 #
-# Signing: automatic, with the team taken from the ROOSTR_TEAM_ID environment
-# variable when generating (`ROOSTR_TEAM_ID=ABCDE12345 xcodegen`). Without it
-# the project still builds for the simulator; device/TestFlight builds need it.
+# Signing: automatic under the Roostr developer team (58GKGS43UM); edit here
+# to build under another account.
 name: Roostr
 options:
   bundleIdPrefix: app.roostr
@@ -12,7 +11,7 @@ options:
   xcodeVersion: "16.1"
 settings:
   base:
-    DEVELOPMENT_TEAM: ${ROOSTR_TEAM_ID}
+    DEVELOPMENT_TEAM: 58GKGS43UM
     CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
