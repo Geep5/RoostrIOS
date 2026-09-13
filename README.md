@@ -84,6 +84,23 @@ xcrun simctl install 'iPhone 17' /tmp/roostr_dd/Build/Products/Debug-iphonesimul
 xcrun simctl launch 'iPhone 17' app.roostr.Roostr      # SIMCTL_CHILD_ROOSTR_IDENTITY=memory SIMCTL_CHILD_ROOSTR_SECRET=<hex> prefills a key
 ```
 
+## TestFlight / App Store
+
+```sh
+# once: Xcode > Settings > Accounts > sign in with the developer Apple ID
+export ROOSTR_TEAM_ID=ABCDE12345           # Team ID from developer.apple.com/account
+Scripts/build-web.sh                       # bundle the current website
+Scripts/archive.sh --upload                # archive (Release, generic iOS), export, upload to App Store Connect
+```
+
+Bundle id `app.roostr.Roostr`; version from `MARKETING_VERSION` /
+`CURRENT_PROJECT_VERSION` in `project.yml` (bump the build number for every
+upload). `App/PrivacyInfo.xcprivacy` declares the required-reason APIs
+(UserDefaults, file timestamps); no tracking, no collected data.
+`ITSAppUsesNonExemptEncryption` is true: NIP-44 is standard encryption, so
+answer "uses encryption / standard algorithms" in App Store Connect and file
+the annual self-classification report.
+
 `-skipPackagePluginValidation` is needed on the command line because
 `swift-secp256k1` ships a build plugin that Xcode otherwise asks you to trust
 in the GUI. In Xcode itself, trust the plugin once when prompted.
