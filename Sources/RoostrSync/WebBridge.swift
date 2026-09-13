@@ -109,6 +109,8 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 	private var listeners: [Task<Void, Never>] = []
 	private let encoder = JSONEncoder()
 	private let decoder = JSONDecoder()
+	/// Observes every request and reply as one line; for tests and the debug console.
+	public var trace: ((String) -> Void)?
 
 	public init(host: WebBridgeHost) {
 		self.host = host
@@ -147,11 +149,17 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 			guard JSONSerialization.isValidJSONObject(body),
 			      let data = try? JSONSerialization.data(withJSONObject: body),
 			      let request = try? decoder.decode(Request.self, from: data)
-			else { return }
+			else {
+				trace?("bridge ← unreadable message \(body)")
+				return
+			}
+			trace?("bridge ← #\(request.id) \(request.method)\(request.method == "mutate" ? " \(request.args?.first?.string ?? "")" : "")")
 			do {
 				let payload = try await dispatch(request.method, request.args ?? [])
+				trace?("bridge → #\(request.id) ok")
 				reply(request.id, ok: true, payload)
 			} catch {
+				trace?("bridge → #\(request.id) error \(error)")
 				reply(request.id, ok: false, Failure(message: "\(error)"))
 			}
 		}
