@@ -5,3 +5,4 @@ DerivedData/
 xcuserdata/
 App/Info.plist
 Vendor/.glon-*
+.DS_Store
