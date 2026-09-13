@@ -96,9 +96,9 @@ Bundle id `app.roostr.Roostr`; version from `MARKETING_VERSION` /
 `CURRENT_PROJECT_VERSION` in `project.yml` (bump the build number for every
 upload). `App/PrivacyInfo.xcprivacy` declares the required-reason APIs
 (UserDefaults, file timestamps); no tracking, no collected data.
-`ITSAppUsesNonExemptEncryption` is true: NIP-44 is standard encryption, so
-answer "uses encryption / standard algorithms" in App Store Connect and file
-the annual self-classification report.
+Export compliance is answered per build in App Store Connect (NIP-44 is
+standard encryption: "uses encryption / standard algorithms"); the annual
+self-classification report applies.
 
 `-skipPackagePluginValidation` is needed on the command line because
 `swift-secp256k1` ships a build plugin that Xcode otherwise asks you to trust

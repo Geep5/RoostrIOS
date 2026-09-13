@@ -29,10 +29,13 @@ cat > "$out/ExportOptions.plist" <<EOF
 EOF
 
 (cd "$root" && ROOSTR_TEAM_ID="$ROOSTR_TEAM_ID" xcodegen generate --quiet)
+# The archive itself is built unsigned: automatic signing at archive time wants
+# a development profile, which Apple only issues once a device is registered.
+# Export signs with the App Store distribution profile, which needs no device.
 xcodebuild -project "$root/Roostr.xcodeproj" -scheme Roostr -configuration Release \
-	-destination 'generic/platform=iOS' -archivePath "$archive" \
-	-skipPackagePluginValidation -skipMacroValidation -allowProvisioningUpdates \
-	DEVELOPMENT_TEAM="$ROOSTR_TEAM_ID" archive
+	-destination 'generic/platform=iOS' -archivePath "$archive" -derivedDataPath "$out/DerivedData" \
+	-skipPackagePluginValidation -skipMacroValidation \
+	CODE_SIGN_STYLE=Manual CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= PROVISIONING_PROFILE_SPECIFIER= archive
 xcodebuild -exportArchive -archivePath "$archive" -exportPath "$out/export" \
 	-exportOptionsPlist "$out/ExportOptions.plist" -allowProvisioningUpdates
 echo "archive: $archive"

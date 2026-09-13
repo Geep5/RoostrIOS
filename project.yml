@@ -41,10 +41,11 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
-        # NIP-44 (ChaCha20/HKDF/HMAC) is standard, non-proprietary encryption:
-        # "uses encryption" is answered YES in App Store Connect with the
-        # mass-market exemption; the annual self-classification report applies.
-        ITSAppUsesNonExemptEncryption: true
+        # iPad multitasking requires every orientation.
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        # Export compliance is answered in App Store Connect (NIP-44 is standard
+        # encryption); an ITSAppUsesNonExemptEncryption key would need the
+        # compliance code that answer produces, so it is deliberately absent.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.roostr.Roostr
