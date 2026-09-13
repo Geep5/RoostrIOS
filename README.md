@@ -72,8 +72,21 @@ brew install xcodegen && xcodegen      # Roostr.xcodeproj for the app shell
 odin build src -o:speed -out:/tmp/roostr-relay && PORT=7799 DB_PATH=/tmp/relay-test.db /tmp/roostr-relay
 ```
 
-Running on a simulator needs the iOS platform installed in Xcode
-(`xcodebuild -downloadPlatform iOS`).
+## Run on iOS
+
+```sh
+xcodebuild -downloadPlatform iOS                       # once; ~8 GB simulator runtime
+Scripts/build-web.sh && xcodegen                       # web bundle + Roostr.xcodeproj
+xcodebuild -project Roostr.xcodeproj -scheme Roostr -destination 'platform=iOS Simulator,name=iPhone 17' \
+  -derivedDataPath /tmp/roostr_dd -skipPackagePluginValidation -skipMacroValidation build
+xcrun simctl boot 'iPhone 17'
+xcrun simctl install 'iPhone 17' /tmp/roostr_dd/Build/Products/Debug-iphonesimulator/Roostr.app
+xcrun simctl launch 'iPhone 17' app.roostr.Roostr      # SIMCTL_CHILD_ROOSTR_IDENTITY=memory SIMCTL_CHILD_ROOSTR_SECRET=<hex> prefills a key
+```
+
+`-skipPackagePluginValidation` is needed on the command line because
+`swift-secp256k1` ships a build plugin that Xcode otherwise asks you to trust
+in the GUI. In Xcode itself, trust the plugin once when prompted.
 
 ## Run on macOS
 
