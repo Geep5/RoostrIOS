@@ -1,0 +1,31 @@
+{
+  "abiVersion": 1,
+  "compiler": "/opt/homebrew/bin/odin version dev-2026-07:819fdc7a8",
+  "target": "js_wasm32",
+  "artifact": "engine.wasm",
+  "sha256": "2b3437c9da97d517379fc8286aab605c7b1e1a293bbacda6504854b11b1bc25a",
+  "sourceFingerprint": "60a69f4d3a395fbafac4d7b3bf1cb61ea8f2768cdb73c1dbcf70eb957c30ad34",
+  "sourceFiles": {
+    "abi/abi.odin": "d4d2b2b0adac2067d0c6b669993490b1716537b96831300064af6e7b2646c283",
+    "core/authority.odin": "0b3a09dffef10323c96e1dbd82bfccc28feab32d8b0c88e899ac9cb2c08a1764",
+    "core/bech32.odin": "5c99ff01ca2bdda79a0e4e0b775744150093583d00f07f9b0668ab27963d1c8c",
+    "core/codec_json.odin": "e9e5e0ca74dd8e54e7772288dc67629731f1b68fccbc2d2b8e0b728d41fca82a",
+    "core/dag.odin": "ada8d08dfb4ca83c1946947d67220a065f2121ce156618c23c028cfe5621014f",
+    "core/dispatch.odin": "955b309d249c200b564c451e4c0a44569b667f4ddccef32a22d1645617192a77",
+    "core/jsonx.odin": "46f5d6fd05b572c8023b77e58f0a31205551281de4d59dca78961301ca7f4d39",
+    "core/mutate.odin": "a5ff51b29d7f9ab3d6b3589f2ee651b45628c99d8ad7ffce900cc57e714015dd",
+    "core/nip44.odin": "71412d79e95596ecf93c1ffb11909824bb6b44c1bd3fea3ca9c351a46fed9e82",
+    "core/proto.odin": "fa914e2ba4c4e404ba89c8427381601fb8832049b82b754ada76ae7948528791",
+    "core/query.odin": "e9a5aa5783640a6c0d8868f15486a31ed0767adff6628c53a157e7dd361c85ca",
+    "core/replay.odin": "d9a320dda1ccaa217bbcd5ca33c1b129f586456e79908694d3d2c58c59e1a4e5",
+    "core/sync_outbox.odin": "302aca2530f9e001ca847a32aeb2fd94d0ac9f3f0ff9d92caf138b2cf99a4190",
+    "core/sync_session.odin": "c59f4041cdd3acf37265f01a9dbc60408744fb61192d2d0140276412fcbf6678",
+    "core/wire.odin": "131052a1b4183b5b5ec495e6f6f3f5bbef3891ea8791f3ed4889792d2196b226",
+    "wasm/main.odin": "007614b554da7e706c3f2740338357df67ba9f83bfe40c89d2021e0343359474",
+    "build-wasm.mjs": "7f230f2118be60eac27e57272a8461d33e338d3aef55a9a6af289fa3404d79ff"
+  },
+  "runtimeFiles": {
+    "src/lib/engine/core.ts": "d0cd39bacf82c5e60ec6ffd6a69da0b526f008b6d42b383f696c9ddd06ac4fa0",
+    "src/lib/engine/odin-runtime.ts": "d3c8f6456b7b833a6cf4d71a7767c000e669697bfd2c8ba0c23845c1ac4df122"
+  }
+}

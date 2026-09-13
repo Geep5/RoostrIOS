@@ -15,7 +15,7 @@ struct IdentityView: View {
 				.multilineTextAlignment(.center)
 
 			Button("Generate a new key") {
-				Task { await run { await model.generateKey() } }
+				Task { await run { try await model.generateKey() } }
 			}
 			.buttonStyle(.borderedProminent)
 
@@ -39,13 +39,13 @@ struct IdentityView: View {
 
 	private func importKey() {
 		let text = secret
-		Task { await run { await model.importKey(text) } }
+		Task { await run { try await model.importKey(text) } }
 	}
 
-	private func run(_ work: () async -> Void) async {
+	private func run(_ work: () async throws -> Void) async {
 		busy = true
 		model.lastError = nil
-		await work()
+		do { try await work() } catch { model.lastError = "\(error)" }
 		busy = false
 		if model.key != nil { secret = "" }
 	}

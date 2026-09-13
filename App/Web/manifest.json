@@ -1,0 +1,14 @@
+{
+	"name": "Roostr",
+	"short_name": "Roostr",
+	"description": "Local-first notes, synced end-to-end encrypted over Nostr.",
+	"start_url": "/app",
+	"scope": "/",
+	"display": "standalone",
+	"background_color": "#101216",
+	"theme_color": "#101216",
+	"icons": [
+		{ "src": "/logo.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" },
+		{ "src": "/favicon.png", "sizes": "64x64", "type": "image/png" }
+	]
+}

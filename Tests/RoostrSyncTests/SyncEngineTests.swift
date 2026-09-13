@@ -108,11 +108,12 @@ final class SyncEngineTests: XCTestCase {
 		let second = SyncEngine(key: key, relays: [relay], store: store)
 		await second.start()
 		await second.awaitIdle()
-		let live = try XCTUnwrap(relay.subscribeFilters.last)
+		// The live REQ also carries the gift-wrap filter; the personal one names our key.
+		let live = try XCTUnwrap(relay.subscribeFilters.last { $0.authors != nil })
 		XCTAssertEqual(live.since, cursor + 1)
 		XCTAssertEqual(live.authors, [key.pubkey])
 		XCTAssertEqual(live.kinds, [1078])
-		let walk = try XCTUnwrap(relay.queryFilters.last)
+		let walk = try XCTUnwrap(relay.queryFilters.last { $0.authors != nil })
 		XCTAssertEqual(walk.since, cursor + 1)
 		await second.stop()
 	}

@@ -24,12 +24,26 @@ private enum SessionOwner {
 	static func owns(_ id: ObjectIdentifier) -> Bool { lock.withLock { current == id } }
 }
 
-/// Shared space the session decrypts and authorizes under. v1 installs none.
-struct SharedSpace: Sendable, Equatable {
-	var spaceId: String
-	var keyHex: String
-	var keyId: Int64
-	var owner: String?
+/// What the host knows about a shared space: its key, the key version, and
+/// who may author under it (backend.ts SharedSpaceInfo).
+public struct SharedSpaceInfo: Sendable, Equatable {
+	public var spaceId: String
+	public var keyHex: String
+	public var keyId: Int64
+	/// Hex pubkeys allowed to author events: owner + writer members.
+	public var writers: [String]
+	/// Hex pubkey of the administrator; nil for spaces this device created.
+	public var owner: String?
+
+	public init(spaceId: String, keyHex: String, keyId: Int64, writers: [String], owner: String?) {
+		self.spaceId = spaceId; self.keyHex = keyHex; self.keyId = keyId; self.writers = writers; self.owner = owner
+	}
+}
+
+/// Installed space plus its blinded stream tag `blind(key, "space:"+id)`.
+private struct SharedSpace: Sendable, Equatable {
+	let info: SharedSpaceInfo
+	let spaceTag: String
 }
 
 private struct ImportItem: Sendable {
@@ -38,6 +52,11 @@ private struct ImportItem: Sendable {
 	let chunkKey: String?
 	let provenance: SharedProvenance?
 }
+
+/// NIP-59 gift wrap: space-key invites and join requests, addressed by pubkey.
+private let giftWrapKind = 1059
+/// Gift wraps randomize created_at up to ~2 days back; look back further.
+private let wrapLookbackSeconds: Int64 = 3 * 86_400
 
 public actor SyncEngine {
 	private static let pageLimit = 128
@@ -65,7 +84,8 @@ public actor SyncEngine {
 	private var walkCoveredUntil: Int64?
 	private var stopped = false
 	private var liveUp = false
-	private var walking = false
+	/// History walks in flight (the bootstrap walk and shared-space backfills).
+	private var activeWalks = 0
 	private var activeLiveEvents = 0
 	private var activeImports = 0
 	private var importedCount = 0
@@ -78,6 +98,8 @@ public actor SyncEngine {
 	private var liveTask: Task<Void, Never>?
 	private var outboxTask: Task<Void, Never>?
 	private var importChain: Task<Error?, Never>?
+	/// Walks run strictly in order, as the browser's backfillChain.
+	private var backfillChain: Task<Result<Bool, Error>, Never>?
 	private var cursorChain: Task<Void, Never>?
 	private var notifyTask: Task<Void, Never>?
 	private var pendingObjects: Set<String> = []
@@ -85,6 +107,7 @@ public actor SyncEngine {
 	private var lastStatus = SyncStatus(phase: .idle)
 	private var statusSinks: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
 	private var commitSinks: [UUID: AsyncStream<[String]>.Continuation] = [:]
+	private var wrapSinks: [UUID: AsyncStream<NostrEvent>.Continuation] = [:]
 
 	public init(key: NostrKey, relays: [RelayClient], store: ChangeStore) {
 		self.key = key
@@ -122,8 +145,12 @@ public actor SyncEngine {
 		let bootstrapped = (try? await store.bootstrapped()) ?? false
 		let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
 		let since: Int64 = bootstrapped ? cursor + 1 : 1
-		walking = true
+		activeWalks += 1
 		walkTask = Task { await self.bootstrap(since: since, resumeUntil: floor, markBootstrapped: !bootstrapped) }
+		if stopped { return }
+		// Gift wraps addressed to us: created_at is randomized, so no cursor;
+		// the consumer's seen-set dedupes.
+		await fetchWraps(from: relays)
 		if stopped { return }
 		subscribeLive()
 		emitLiveStatus()
@@ -140,13 +167,15 @@ public actor SyncEngine {
 		await closeSession()
 		for sink in statusSinks.values { sink.finish() }
 		for sink in commitSinks.values { sink.finish() }
+		for sink in wrapSinks.values { sink.finish() }
 		statusSinks.removeAll()
 		commitSinks.removeAll()
+		wrapSinks.removeAll()
 	}
 
 	/// Test helper: resolves when no walk, import, live event or publish is in flight.
 	public func awaitIdle() async {
-		while walking || activeImports > 0 || activeLiveEvents > 0 || queueRunning {
+		while activeWalks > 0 || activeImports > 0 || activeLiveEvents > 0 || queueRunning {
 			try? await Task.sleep(for: .milliseconds(20))
 		}
 	}
@@ -172,14 +201,29 @@ public actor SyncEngine {
 	}
 
 	private static func spaceJSON(_ space: SharedSpace) -> JSONValue {
-		.object(["spaceId": .string(space.spaceId), "keyHex": .string(space.keyHex), "keyId": .int(space.keyId)])
+		.object(["spaceId": .string(space.info.spaceId), "keyHex": .string(space.info.keyHex), "keyId": .int(space.info.keyId)])
 	}
 
-	/// Replace the shared-space view the session decrypts under.
-	func setSharedSpaces(_ infos: [SharedSpace]) async {
-		spaces = Dictionary(infos.map { ($0.spaceId, $0) }, uniquingKeysWith: { _, last in last })
-		guard sessionOpen else { return }
-		let _: SessionState? = try? await Engine.sync("spaces", ["spaces": .array(infos.map(Self.spaceJSON))])
+	/// Replace the shared-space view the session decrypts under. A space whose
+	/// stream tag is new gets a full backfill plus a live subscription.
+	public func setSharedSpaces(_ infos: [SharedSpaceInfo]) async {
+		let previousTags = Set(spaces.values.map(\.spaceTag))
+		var next: [String: SharedSpace] = [:]
+		for info in infos {
+			guard SpaceKey.isHex32(info.keyHex), let tag = try? await Engine.blind(keyHex: info.keyHex, id: "space:\(info.spaceId)") else { continue }
+			next[info.spaceId] = SharedSpace(info: info, spaceTag: tag)
+		}
+		spaces = next
+		if sessionOpen {
+			let _: SessionState? = try? await Engine.sync("spaces", ["spaces": .array(next.values.map(Self.spaceJSON))])
+		}
+		let tags = Set(next.values.map(\.spaceTag))
+		if stopped || !liveUp { return } // start() wires subscriptions itself
+		if tags != previousTags { subscribeLive() }
+		if !tags.subtracting(previousTags).isEmpty {
+			activeWalks += 1
+			Task { await self.bootstrap(since: 1, resumeUntil: nil, markBootstrapped: false) }
+		}
 	}
 
 	private func mirror(_ groups: [ReplayGroup]) {
@@ -224,8 +268,9 @@ public actor SyncEngine {
 
 	// ── Backfill ──
 
+	/// Runs one history walk; the caller has counted it in `activeWalks`.
 	private func bootstrap(since: Int64, resumeUntil: Int64?, markBootstrapped: Bool) async {
-		defer { walking = false }
+		defer { activeWalks -= 1 }
 		do {
 			let complete = try await backfill(since: since, resumeUntil: resumeUntil)
 			if stopped { return }
@@ -237,14 +282,21 @@ public actor SyncEngine {
 		}
 	}
 
+	/// Walks run strictly in order: each waits for the previous one.
 	private func backfill(since: Int64, resumeUntil: Int64?) async throws -> Bool {
-		do {
-			return try await walkHistory(since: since, resumeUntil: resumeUntil)
-		} catch {
-			await recordReplayFault(1)
-			await persistCursor()
-			throw error
+		let previous = backfillChain
+		let task = Task<Result<Bool, Error>, Never> {
+			_ = await previous?.value
+			do {
+				return .success(try await self.walkHistory(since: since, resumeUntil: resumeUntil))
+			} catch {
+				await self.recordReplayFault(1)
+				await self.persistCursor()
+				return .failure(error)
+			}
 		}
+		backfillChain = task
+		return try await task.value.get()
 	}
 
 	/// Returns true only when EVERY relay was walked to exhaustion.
@@ -265,12 +317,15 @@ public actor SyncEngine {
 		let checkpoint = replayFaultGeneration
 		await persistCursor()
 
-		let filter = NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)
+		var filters = [NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)]
+		for space in spaces.values { filters.append(NostrFilter(kinds: [Engine.changeKind], since: since, tagged: ["h": [space.spaceTag]])) }
 		var byId: [String: NostrEvent] = [:]
 		var complete = !relays.isEmpty
 		await withTaskGroup(of: (events: [NostrEvent], complete: Bool).self) { group in
 			for relay in relays {
-				group.addTask { await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
+				for filter in filters {
+					group.addTask { await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
+				}
 			}
 			for await result in group {
 				for event in result.events { byId[event.id] = event }
@@ -385,29 +440,19 @@ public actor SyncEngine {
 		var failure: Error?
 		defer { activeImports -= 1 }
 		do {
-			for item in batch {
-				guard let objectId = item.change["objectId"]?.string, let id = item.change["id"]?.string else { throw SyncError.malformedChange }
-				if let provenance = item.provenance {
-					guard let space = spaces[provenance.spaceId] else { continue }
-					let trustedSpace = try await Engine.replay(try await store.changesFor(objectId: provenance.spaceId).map(\.json))
-					let existing = try await Engine.replay(try await store.changesFor(objectId: objectId).map(\.json))
-					let verdict: AuthorizeResult = try await Engine.sync("authorize", [
-						"change": item.change,
-						"provenance": .object(["spaceId": .string(provenance.spaceId), "keyId": .int(provenance.keyId), "signer": .string(provenance.signer)]),
-						"space": .object(["spaceId": .string(space.spaceId), "keyId": .int(space.keyId), "owner": .string(space.owner ?? pk)]),
-						"trustedSpace": trustedSpace ?? .null,
-						"existing": existing ?? .null,
-					])
-					if !verdict.ok { continue }
+			// Same-second events sort by id, so a shared object's later change can
+			// precede the one that creates it and the gate refuses it as never
+			// created. Refused items get another pass once the batch has landed,
+			// until a pass imports nothing more.
+			var pending = batch
+			while !pending.isEmpty {
+				var refused: [ImportItem] = []
+				for item in pending {
+					if try await importOne(item, settled: &settled) { continue }
+					refused.append(item)
 				}
-				importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: item.bytes, json: item.change)])
-				let publishKey = item.provenance.map { "\($0.spaceId)/\($0.keyId)/\(id)" } ?? id
-				try await store.markPublished(key: publishKey)
-				if let chunkKey = item.chunkKey {
-					settled.insert(chunkKey)
-					await settle(chunkKey, imported: true)
-				}
-				pendingObjects.insert(objectId)
+				if refused.count == pending.count { break }
+				pending = refused
 			}
 			if immediateNotify { flushObjectNotify() } else { scheduleObjectNotify() }
 		} catch {
@@ -419,6 +464,35 @@ public actor SyncEngine {
 			if let chunkKey = item.chunkKey, !settled.contains(chunkKey) { await settle(chunkKey, imported: false) }
 		}
 		return failure
+	}
+
+	/// Stores one change unless the authority gate refuses it (false).
+	private func importOne(_ item: ImportItem, settled: inout Set<String>) async throws -> Bool {
+		guard let objectId = item.change["objectId"]?.string, let id = item.change["id"]?.string else { throw SyncError.malformedChange }
+		if let provenance = item.provenance {
+			// The installed key version and its administrator (the keyring's
+			// owner, else this identity) decide; a rotated keyId is refused.
+			guard let space = spaces[provenance.spaceId]?.info else { return false }
+			let trustedSpace = try await Engine.replay(try await store.changesFor(objectId: provenance.spaceId).map(\.json))
+			let existing = try await Engine.replay(try await store.changesFor(objectId: objectId).map(\.json))
+			let verdict: AuthorizeResult = try await Engine.sync("authorize", [
+				"change": item.change,
+				"provenance": .object(["spaceId": .string(provenance.spaceId), "keyId": .int(provenance.keyId), "signer": .string(provenance.signer)]),
+				"space": .object(["spaceId": .string(space.spaceId), "keyId": .int(space.keyId), "owner": .string(space.owner ?? pk)]),
+				"trustedSpace": trustedSpace ?? .null,
+				"existing": existing ?? .null,
+			])
+			if !verdict.ok { return false }
+		}
+		importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: item.bytes, json: item.change)])
+		let publishKey = item.provenance.map { "\($0.spaceId)/\($0.keyId)/\(id)" } ?? id
+		try await store.markPublished(key: publishKey)
+		if let chunkKey = item.chunkKey {
+			settled.insert(chunkKey)
+			await settle(chunkKey, imported: true)
+		}
+		pendingObjects.insert(objectId)
+		return true
 	}
 
 	private func recordReplayFault(_ at: Int64) async {
@@ -459,26 +533,38 @@ public actor SyncEngine {
 	private func subscribeLive() {
 		liveTask?.cancel()
 		let since = cursor + 1
+		let tags = spaces.values.map(\.spaceTag)
 		liveTask = Task {
 			await withTaskGroup(of: Void.self) { group in
 				for relay in self.relays {
-					group.addTask { await self.liveLoop(relay, since: since) }
+					group.addTask { await self.liveLoop(relay, since: since, spaceTags: tags) }
 				}
 			}
 		}
 		liveUp = true
 	}
 
+	/// Personal changes, every installed space's stream, and gift wraps for us.
+	private func liveFilters(since: Int64, spaceTags: [String]) -> [NostrFilter] {
+		var filters = [NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)]
+		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: [Engine.changeKind], since: since, tagged: ["h": spaceTags])) }
+		filters.append(NostrFilter(kinds: [giftWrapKind], since: Int64(Date().timeIntervalSince1970) - wrapLookbackSeconds, tagged: ["p": [pk]]))
+		return filters
+	}
+
 	/// One relay's live subscription; a dropped stream resubscribes from the
-	/// current cursor after 2 s, doubling up to 60 s.
-	private func liveLoop(_ relay: RelayClient, since initial: Int64) async {
+	/// current cursor after 2 s, doubling up to 60 s. Wraps are re-queried on
+	/// every reconnect: their created_at is randomized, so no cursor covers them.
+	private func liveLoop(_ relay: RelayClient, since initial: Int64, spaceTags: [String]) async {
 		var since = initial
 		var backoff = Self.liveBackoffFloor
+		var reconnecting = false
 		while !stopped && !Task.isCancelled {
-			let stream = relay.subscribe([NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)])
+			if reconnecting { await fetchWraps(from: [relay]) }
+			let stream = relay.subscribe(liveFilters(since: since, spaceTags: spaceTags))
 			do {
 				for try await event in stream {
-					await handleLiveEvent(event)
+					if event.kind == giftWrapKind { deliverWrap(event) } else { await handleLiveEvent(event) }
 					backoff = Self.liveBackoffFloor
 				}
 			} catch {
@@ -489,7 +575,62 @@ public actor SyncEngine {
 			try? await Task.sleep(for: backoff)
 			backoff = min(backoff * 2, Self.liveBackoffCeiling)
 			since = cursor + 1
+			reconnecting = true
 		}
+	}
+
+	// ── Gift wraps ──
+
+	/// Every stored wrap addressed to us, oldest first, from each of `relays`.
+	private func fetchWraps(from relays: [RelayClient]) async {
+		let filter = NostrFilter(kinds: [giftWrapKind], tagged: ["p": [pk]])
+		var byId: [String: NostrEvent] = [:]
+		await withTaskGroup(of: [NostrEvent].self) { group in
+			for relay in relays {
+				group.addTask { (try? await relay.query([filter], timeout: Self.queryTimeout)) ?? [] }
+			}
+			for await events in group {
+				for event in events { byId[event.id] = event }
+			}
+		}
+		for event in byId.values.sorted(by: { $0.created_at != $1.created_at ? $0.created_at < $1.created_at : $0.id < $1.id }) { deliverWrap(event) }
+	}
+
+	private func deliverWrap(_ event: NostrEvent) {
+		guard event.kind == giftWrapKind, NostrKey.verify(event) else { return }
+		for sink in wrapSinks.values { sink.yield(event) }
+	}
+
+	/// Signature-verified kind-1059 events addressed to this key, from the
+	/// start-up query, reconnect catch-ups and the live subscription.
+	public func wrapUpdates() -> AsyncStream<NostrEvent> {
+		let id = UUID()
+		let (stream, continuation) = AsyncStream<NostrEvent>.makeStream()
+		wrapSinks[id] = continuation
+		continuation.onTermination = { _ in Task { await self.dropWrapSink(id) } }
+		return stream
+	}
+
+	private func dropWrapSink(_ id: UUID) { wrapSinks[id] = nil }
+
+	/// Every event any relay returns for `filters` within `timeout`, deduplicated.
+	public func query(_ filters: [NostrFilter], timeout: Duration) async -> [NostrEvent] {
+		var byId: [String: NostrEvent] = [:]
+		await withTaskGroup(of: [NostrEvent].self) { group in
+			for relay in relays {
+				group.addTask { (try? await relay.query(filters, timeout: timeout)) ?? [] }
+			}
+			for await events in group {
+				for event in events { byId[event.id] = event }
+			}
+		}
+		return Array(byId.values)
+	}
+
+	/// Sends one already-signed event (gift wrap, allowlist) to the relays;
+	/// succeeds when any relay accepts it.
+	public func publishEvent(_ event: NostrEvent) async throws {
+		try await publishToAnyRelay(event)
 	}
 
 	private func handleLiveEvent(_ event: NostrEvent) async {
@@ -527,14 +668,22 @@ public actor SyncEngine {
 
 	// ── Publish ──
 
-	/// Hands a locally committed change to the outbox. v1 publishes personal
-	/// candidates only (`key = changeId`).
-	public func publish(bytes: Data, changeId: String, objectId: String) async throws {
-		let item = PendingPublish(key: changeId, objectId: objectId, changeId: changeId, bytes: bytes)
-		if try await store.isPublished(key: item.key) { return }
-		let saved = try await store.pending(key: item.key)
-		if saved == nil { try await store.savePending(item) }
-		try await offerToOutbox(saved ?? item)
+	/// Hands a locally committed change to the outbox: the personal obligation
+	/// (`key = changeId`) and, when `spaceId` names an installed space, the
+	/// shared one (`key = spaceId/keyId/changeId`) sealed under the space key.
+	/// `spaceId` is the object's `channel` field, or the object itself when it
+	/// is a channel; "" is personal only.
+	public func publish(bytes: Data, changeId: String, objectId: String, spaceId: String = "") async throws {
+		var candidates = [PendingPublish(key: changeId, objectId: objectId, changeId: changeId, bytes: bytes)]
+		if let space = spaces[spaceId]?.info {
+			candidates.append(PendingPublish(key: "\(space.spaceId)/\(space.keyId)/\(changeId)", objectId: objectId, changeId: changeId, bytes: bytes, spaceId: space.spaceId, keyId: space.keyId))
+		}
+		for item in candidates {
+			if try await store.isPublished(key: item.key) { continue }
+			let saved = try await store.pending(key: item.key)
+			if saved == nil { try await store.savePending(item) }
+			try await offerToOutbox(saved ?? item)
+		}
 	}
 
 	/// The engine outbox owns order, dedupe and the rotated-key rule; the store record stays either way.

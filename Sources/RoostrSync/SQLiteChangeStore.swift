@@ -200,7 +200,8 @@ public actor SQLiteChangeStore: ChangeStore {
 
 	// MARK: meta primitives
 
-	private func meta(_ key: String) throws -> String? {
+	/// Host meta row (`MetaStore`): relay lists, wraps seen, join requests.
+	public func meta(_ key: String) throws -> String? {
 		let select = try statement("SELECT value FROM meta WHERE key = ?")
 		try reset(select)
 		try bind(select, 1, key)
@@ -208,7 +209,9 @@ public actor SQLiteChangeStore: ChangeStore {
 		return try stepRow(select) ? columnText(select, 0) : nil
 	}
 
-	private func setMeta(_ key: String, _ value: String) throws {
+	/// Upserts the row; nil deletes it.
+	public func setMeta(_ key: String, _ value: String?) throws {
+		guard let value else { try deleteMeta(key); return }
 		let upsert = try statement("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 		try reset(upsert)
 		try bind(upsert, 1, key)
@@ -308,3 +311,5 @@ public actor SQLiteChangeStore: ChangeStore {
 		return Data(bytes: base, count: count)
 	}
 }
+
+extension SQLiteChangeStore: MetaStore {}

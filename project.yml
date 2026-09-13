@@ -13,10 +13,17 @@ targets:
   Roostr:
     type: application
     platform: iOS
-    sources: [App]
+    sources:
+      - path: App
+        excludes: [Web]
+      # The website's static build (Scripts/build-web.sh), served by RoostrSchemeHandler as roostr://app/.
+      - path: App/Web
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: RoostrIOS
         product: RoostrUI
+      - sdk: WebKit.framework
     info:
       path: App/Info.plist
       properties:

@@ -1,0 +1,23 @@
+{
+  "recipientSecret": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+  "senderPubkey": "d98a7def67e8370118f636620d0be08ed63344df68082b4f2f1844e7ce601483",
+  "rumor": {
+    "kind": 24891,
+    "tags": [],
+    "content": "{\"t\":\"space-invite\",\"space\":\"space-fixture\",\"name\":\"Fixture ✓\",\"key\":\"abababababababababababababababababababababababababababababababab\",\"keyId\":3}"
+  },
+  "wrap": {
+    "kind": 1059,
+    "content": "Ainiw2O5vXxYjMtLDwaUL7rrqK39SG1u4T0pgeWUoHj4Gw7c2Kv3brbtAjw1kaIZbrMGLFy7PDjPYYpCeYnjdRHVrKJligIhXgDWCzeBsvyxGhacsABzE/t5Cc3YyEmfj8UhXd+obnJKJayKghNDcHGhZC24Sh0kLEFtzCb+Hj5QbO1GKOfFFNf9vYAnUB+GvSadriTJPLS+ivRIgl27Anh6iNKC4aEbNOFfw8wHaMpKODACx68cplbGxW7jCDi244bFIOnNLJCZcLPuqLvkeej1ZNuU9OiJLdimQvdX9UMkHdet6T2Ri0q46M+x/WAfCzjXVMz4Fiu7wQeOk0/he20KYQhYtGUhoHgkmM6LZ0G8eCpFpAL4XcvS6eHb5ZHiE0tETgXeynNJOMrh5OXRXtxWt5tzNTmImOiGwdOJ/g25/MYyPoeugIcAzO5ES1fLyh+UXqpSsYdQv8uGCB79Iuj/Cd7Wm8O3y7Ej0eHd+q2CSbr16cedfhJ+R0a4cgbMKai0S3S8IbwecDI1SD1c3jDnk38FEOfv4VKaXs7/4bC4Y9REaM267G8GEaPmbESSusE4q8IC20uD8qwKCtDjksLnPOKUk4c5KWAG2IEeLTUDmOshVZwNFwqFCq/w0s0LrxlVN2GKS8DaOY/4wsN5daM8yA/s8v5H6p9WS8VOBgvpYAWwqkep9RtmqslfYWNS6wX093mBqv9+1sjjbfEho+RcxSEA46o84jLInYuzUNf/1ZWY7ZWbe982FhpKjYRxRLWRDQ7yP20yjXEdjvUcj+SoUZNmSXxlQKhqj8QlTIFifgJOZpyDb289JyNYdSM1os8sqg2ouKscXAiwExwn/i6Ym7uXojsEcG7Ne9PGMH3iE6SPrywA7Jkg7X9pDYmHwt0ezRzhGTgMSxJCdgp3vz3HrHiNAUFQq+90hyHldv/ihHwwEbOKX2ohRlz/Bhcmzo6J+wT5fcHDqycFMD3OLlU0EbkMu5I+M4HpbDTdMuiTHPRZBACwzz86pJL4fn3cV0H1sFxm7xoRCo42qwmkAxdPtCzFtrhec3SMT8HA7eaOZcU/mhUnar9pbhJ1BDt+7PQxo7mmpZauO0wrWJN80RuxpTgIiFJWctkrSYazinDcjrd53E/U+I8eR0odyOnJlBsFE/o0S1nKsR+uxakPpsKEnYsRXXmhE8CU52tteyIo1XFfMb2puj/GDq/hoMfmbu4ieHKYAIUGs8BS/TxhEJlQUwRMgwrBmuEaMJ3AP9t1UqIfwlAcLVLOBKE+/NVofnnvl1bxSxnnC7mVnhBI3rcmjPLl5vSDvn01M+vYqHbI/wYIRfKSk0bMX8rGv3TQo63u44b2FVHVoq/mbxr88AptjrzC/1suSQGkOd4lK6vvZUP8WzeryhCXk3+UOwD4ewFBJhtCi8ZPpw4p60xoMm2mXzoNG+jj/hCCov5lymNG6/8=",
+    "created_at": 1789178322,
+    "tags": [
+      [
+        "p",
+        "505f234a81fe3af88625ebda259dbaec44c72b181e2f64735f8b8ec8d7cf7377"
+      ]
+    ],
+    "pubkey": "5c9450fa7975726b83d20662f054fb48fa93b8b62b2e64b7ced59c55d51251b0",
+    "id": "3f28db484f0d5def423e0bf089c515188505ef773cb1b293ffed0d37aab984d8",
+    "sig": "9b7dd5ec14364e97b67905f0fd31fa16da415f051676a896070478d2ba6163df86e01ef6b90e2d759cdd733cb2c3e204249fe8026c7d8fa0634a6bb19c68e8ee"
+  }
+}

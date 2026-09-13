@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Identity gate: no key → `IdentityView`; key → the object list.
+/// Identity gate: no key → `IdentityView`; key → the web editor.
 public struct RoostrRootView: View {
 	@Environment(AppModel.self) private var model
 
@@ -13,7 +13,7 @@ public struct RoostrRootView: View {
 			} else if model.key == nil {
 				IdentityView()
 			} else {
-				ObjectsView()
+				WebEditorView()
 			}
 		}
 		.frame(minWidth: 360, minHeight: 420)
