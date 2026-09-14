@@ -47,3 +47,39 @@ final class RepeatTests: XCTestCase {
 		XCTAssertNil(cleared["fields"]?["repeat"])
 	}
 }
+
+extension RepeatTests {
+	func testUpcomingOccurrencesListLiveRecurringObjectsSoonestFirst() async throws {
+		let backend = Backend(key: NostrKey.generate(), relays: [FakeRelay()], store: InMemoryChangeStore(), keyring: InMemorySpaceKeyring())
+		await backend.start()
+		defer { Task { await backend.stop() } }
+		let now: Int64 = 1_789_318_800_000 // Sun 2026-09-13 10:00 UTC-7
+		let clock: [String: JSONValue] = ["now_ms": .int(now), "tz_offset_min": .int(-420)]
+		func recurring(_ name: String, type: String, time: Int64, agent: Bool = false) async throws -> String {
+			var fields: [String: JSONValue] = [:]
+			if agent { fields["assignee"] = .object(["stringValue": .string("agent-1")]) }
+			let created = try await backend.mutate(action: "create", params: .object(["name": .string(name), "type_key": .string(type), "fields": .object(fields)]))
+			let id = try XCTUnwrap(created["id"]?.string)
+			_ = try await backend.mutate(action: "repeat_set", params: .object(["object_id": .string(id), "rule": .object(["freq": .string("day"), "interval": .int(1), "time": .int(time)])].merging(clock) { a, _ in a }))
+			return id
+		}
+		let evening = try await recurring("Water the plants", type: "task", time: 1200)   // 20:00 today
+		let noon = try await recurring("Weekly review", type: "page", time: 720, agent: true) // 12:00 today
+		let morning = try await recurring("Stretch", type: "task", time: 420)               // 07:00 → tomorrow
+		_ = try await backend.mutate(action: "create", params: .object(["name": .string("Plain"), "type_key": .string("note")]))
+
+		let upcoming = try await backend.upcomingOccurrences(after: now, limit: 64)
+		XCTAssertEqual(upcoming.map(\.objectId), [noon, evening, morning])
+		XCTAssertEqual(upcoming.map(\.agentOwned), [true, false, false])
+		XCTAssertEqual(upcoming[0].name, "Weekly review")
+		XCTAssertEqual(upcoming[0].at, 1_789_326_000_000) // 2026-09-13T19:00:00Z
+		let capped = try await backend.upcomingOccurrences(after: now, limit: 2)
+		XCTAssertEqual(capped.count, 2)
+
+		// Completing moves an object later in the list; deleting removes it.
+		_ = try await backend.mutate(action: "occurrence_complete", params: .object(["object_id": .string(noon)].merging(clock) { a, _ in a }))
+		_ = try await backend.mutate(action: "delete", params: .object(["object_id": .string(evening)]))
+		let after = try await backend.upcomingOccurrences(after: now, limit: 64)
+		XCTAssertEqual(after.map(\.objectId), [morning, noon])
+	}
+}

@@ -13,16 +13,24 @@ public final class AppModel: WebBridgeHost {
 	public private(set) var backend: Backend?
 	public private(set) var loaded = false
 	public var lastError: String?
+	/// In-app path the editor should open next (set by a notification tap); the editor clears it.
+	public var pendingRoute: String?
+	/// Last reminder schedule summary; shown only with `ROOSTR_DEBUG_REMINDERS`.
+	public private(set) var remindersDebug = ""
+	public let showRemindersDebug = ProcessInfo.processInfo.environment["ROOSTR_DEBUG_REMINDERS"] == "1"
 
 	private let identity: IdentityStore
 	private let keyring: SpaceKeyring
 	private let databasePath: String
 	private var store: SQLiteChangeStore?
+	private let reminders = Reminders()
 
 	public init(identity: IdentityStore, keyring: SpaceKeyring, databasePath: String) {
 		self.identity = identity
 		self.keyring = keyring
 		self.databasePath = databasePath
+		reminders.onOpen = { [weak self] objectId in self?.pendingRoute = "/app/object/\(objectId)" }
+		reminders.onScheduled = { [weak self] summary in self?.remindersDebug = summary }
 	}
 
 	/// Production configuration: Keychain identity, relays from
@@ -131,9 +139,11 @@ public final class AppModel: WebBridgeHost {
 		self.store = store
 		self.backend = backend
 		await backend.start()
+		reminders.follow(backend)
 	}
 
 	private func teardown() async {
+		reminders.stop()
 		if let backend { await backend.stop() }
 		if let store { await store.close() }
 		backend = nil

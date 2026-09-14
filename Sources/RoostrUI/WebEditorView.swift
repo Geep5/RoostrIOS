@@ -14,6 +14,13 @@ public struct WebEditorView: View {
 		WebViewRepresentable(model: model)
 	}
 
+	/// A pending route (notification tap) is handed to the bridge once and cleared.
+	static func consumeRoute(_ model: AppModel, _ bridge: WebBridge) {
+		guard let route = model.pendingRoute else { return }
+		bridge.navigate(to: route)
+		Task { @MainActor in model.pendingRoute = nil }
+	}
+
 	/// Where the website's build lives: `ROOSTR_WEB` for the runner, the app
 	/// bundle's `Web` folder reference, or `App/Web` next to this package when
 	/// running from source (`swift run roostr-mac`).
@@ -36,7 +43,9 @@ private struct WebViewRepresentable: UIViewRepresentable {
 		context.coordinator.makeWebView(bundleURL: WebEditorView.bundleURL())
 	}
 
-	func updateUIView(_ webView: WKWebView, context: Context) {}
+	func updateUIView(_ webView: WKWebView, context: Context) {
+		WebEditorView.consumeRoute(model, context.coordinator)
+	}
 
 	static func dismantleUIView(_ webView: WKWebView, coordinator: WebBridge) {
 		coordinator.detach()
@@ -52,7 +61,9 @@ private struct WebViewRepresentable: NSViewRepresentable {
 		context.coordinator.makeWebView(bundleURL: WebEditorView.bundleURL())
 	}
 
-	func updateNSView(_ webView: WKWebView, context: Context) {}
+	func updateNSView(_ webView: WKWebView, context: Context) {
+		WebEditorView.consumeRoute(model, context.coordinator)
+	}
 
 	static func dismantleNSView(_ webView: WKWebView, coordinator: WebBridge) {
 		coordinator.detach()

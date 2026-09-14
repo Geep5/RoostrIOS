@@ -84,6 +84,19 @@ xcrun simctl install 'iPhone 17' /tmp/roostr_dd/Build/Products/Debug-iphonesimul
 xcrun simctl launch 'iPhone 17' app.roostr.Roostr      # SIMCTL_CHILD_ROOSTR_IDENTITY=memory SIMCTL_CHILD_ROOSTR_SECRET=<hex> prefills a key
 ```
 
+## Reminders
+
+The phone runs no scheduler and no agents. It mirrors every recurring object's
+next occurrence (`repeat.next`, kept by the engine) into pending local
+notifications after each commit — the soonest 64, rebuilt on every change —
+and asks for notification permission the first time there is something to
+remind about. Tapping a notification opens the object. Agent-owned objects
+say so in the reminder: they run on the machine serving their space.
+
+```sh
+Scripts/uitest-reminders.sh            # simulator + local relay: permission, one pending reminder, tap opens the object
+```
+
 ## TestFlight / App Store
 
 ```sh

@@ -134,6 +134,13 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 		return webView
 	}
 
+	/// Navigates the SPA to an in-app path (e.g. `/app/object/<id>`) without a reload.
+	public func navigate(to path: String) {
+		guard let webView else { return }
+		let literal = String(decoding: (try? JSONEncoder().encode(path)) ?? Data("\"/app\"".utf8), as: UTF8.self)
+		webView.evaluateJavaScript("history.pushState({}, '', \(literal)); dispatchEvent(new PopStateEvent('popstate', { state: {} }));")
+	}
+
 	/// Drops the event forwarders; call when the web view goes away.
 	public func detach() {
 		unsubscribe()

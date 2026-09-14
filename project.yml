@@ -52,3 +52,23 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_VERSION: "5.10"
         TARGETED_DEVICE_FAMILY: "1,2"
+  RoostrUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [AppUITests]
+    dependencies:
+      - target: Roostr
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.roostr.RoostrUITests
+        TEST_TARGET_NAME: Roostr
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Roostr:
+    build:
+      targets: { Roostr: all, RoostrUITests: [test] }
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets: [RoostrUITests]

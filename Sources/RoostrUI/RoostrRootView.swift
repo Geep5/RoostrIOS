@@ -14,6 +14,15 @@ public struct RoostrRootView: View {
 				IdentityView()
 			} else {
 				WebEditorView()
+					.overlay(alignment: .bottom) {
+						if model.showRemindersDebug {
+							Text(model.remindersDebug)
+								.font(.caption2.monospaced())
+								.padding(4)
+								.background(.thinMaterial)
+								.accessibilityIdentifier("reminders-debug")
+						}
+					}
 			}
 		}
 		.frame(minWidth: 360, minHeight: 420)
