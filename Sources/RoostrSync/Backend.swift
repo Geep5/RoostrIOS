@@ -85,6 +85,10 @@ public actor Backend {
 		// after start republishes whatever the relays still lack.
 		await refreshShared()
 		await engine.start()
+		// Converge the bundled catalog (new relations/types the engine added
+		// since this space was seeded) - same boot step as the native daemon;
+		// idempotent, so a converged space commits nothing.
+		_ = try? await mutate(action: "bootstrap_space_defaults", params: .object([:]))
 		scheduleRefreshShared()
 	}
 
