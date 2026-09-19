@@ -1,33 +1,4 @@
-<!doctype html>
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-		<style>
-			/* App-like touch: no double-tap zoom, no orientation text inflation. */
-			html {
-				touch-action: manipulation;
-				-webkit-text-size-adjust: 100%;
-			}
-		</style>
-		<meta name="text-scale" content="scale" />
-		<meta name="theme-color" content="#1e1e20" />
-		<link rel="icon" type="image/png" href="/favicon.png" />
-		<link rel="manifest" href="/manifest.json" />
-		<link rel="apple-touch-icon" href="/logo.png" />
-		<link href="./_app/immutable/entry/start.BDA3KuCh.js" rel="modulepreload">
-		<link href="./_app/immutable/chunks/Dz7udl-p.js" rel="modulepreload">
-		<link href="./_app/immutable/chunks/Cg2ytOsU.js" rel="modulepreload">
-		<link href="./_app/immutable/entry/app.CpEfVNRO.js" rel="modulepreload">
-		<link href="./_app/immutable/chunks/HclGiUj8.js" rel="modulepreload">
-		<link href="./_app/immutable/chunks/xihTtKlq.js" rel="modulepreload">
-		<link href="./_app/immutable/nodes/0.BiMFw_qf.js" rel="modulepreload">
-		<link href="./_app/immutable/nodes/9.vBcflP28.js" rel="modulepreload">
-		<!--12qhfyh--><link rel="icon" type="image/png" href="/favicon.png"/><!----><!--7ke6fz--><meta name="description" content="What Roostr stores, where it goes, and who can see it."/><!----><title>Privacy — Roostr</title>
-		<link href="./_app/immutable/assets/9.B9pwQAp0.css" rel="stylesheet">
-	</head>
-	<body data-sveltekit-preload-data="hover">
-		<div style="display: contents"><!--[--><!--[0--><!--[--><!--[-1--><!--[--><main class="page svelte-7ke6fz"><a class="home svelte-7ke6fz" href="/">← Roostr</a> <h1 class="svelte-7ke6fz">Privacy policy</h1> <p class="updated svelte-7ke6fz">Effective 13 September 2026</p> <p class="svelte-7ke6fz">Roostr is a local-first notes app. It is built so that the people who run it — including us —
+import{G as e,M as t,P as n,S as r,Y as i}from"../chunks/Cg2ytOsU.js";import"../chunks/xihTtKlq.js";var a=n(`<meta name="description" content="What Roostr stores, where it goes, and who can see it."/>`),o=n(`<main class="page svelte-7ke6fz"><a class="home svelte-7ke6fz" href="/">← Roostr</a> <h1 class="svelte-7ke6fz">Privacy policy</h1> <p class="updated svelte-7ke6fz">Effective 13 September 2026</p> <p class="svelte-7ke6fz">Roostr is a local-first notes app. It is built so that the people who run it — including us —
 		cannot read your notes. This page describes exactly what is stored, where it travels, and what
 		anyone along the way can see. It applies to the Roostr apps for iOS, the web app at roostr.space,
 		and the default relay we operate.</p> <h2 class="svelte-7ke6fz">No accounts, no analytics</h2> <p class="svelte-7ke6fz">Roostr has no user accounts. Your identity is a cryptographic key pair that is generated on your
@@ -52,29 +23,4 @@
 		remove those, delete the objects in the app or ask us to purge everything published under
 		your public key.</p> <h2 class="svelte-7ke6fz">Changes and contact</h2> <p class="svelte-7ke6fz">If this policy changes we will update the date above and note the change on this page.
 		Questions: <a href="mailto:privacy@roostr.space" class="svelte-7ke6fz">privacy@roostr.space</a>. The source of every
-		Roostr component is public at <a href="https://github.com/Geep5" class="svelte-7ke6fz">github.com/Geep5</a>.</p></main><!--]--><!--]--><!----><!--]--><!--]--> <!--[-1--><!--]--><!--]-->
-			
-			<script>
-				{
-					__sveltekit_1t5w58 = {
-						base: new URL(".", location).pathname.slice(0, -1)
-					};
-
-					const element = document.currentScript.parentElement;
-
-					Promise.all([
-						import("./_app/immutable/entry/start.BDA3KuCh.js"),
-						import("./_app/immutable/entry/app.CpEfVNRO.js")
-					]).then(([kit, app]) => {
-						kit.start(app, element, {
-							node_ids: [0, 9],
-							data: [null,null],
-							form: null,
-							error: null
-						});
-					});
-				}
-			</script>
-		</div>
-	</body>
-</html>
+		Roostr component is public at <a href="https://github.com/Geep5" class="svelte-7ke6fz">github.com/Geep5</a>.</p></main>`);function s(n){var s=o();r(`7ke6fz`,n=>{var r=a();e(()=>{i.title=`Privacy — Roostr`}),t(n,r)}),t(n,s)}export{s as component};

@@ -48,6 +48,9 @@ public actor Backend {
 	/// Invite wraps go out one batch at a time so the sent-map stays idempotent.
 	var inviteChain: Task<Void, Never>?
 	private var commitSinks: [UUID: AsyncStream<[String]>.Continuation] = [:]
+	/// Actor reentrancy must not split a read/plan/commit claim transaction.
+	private var mutationTail: Task<Void, Never>?
+	private var rebuilding: Task<Void, Error>?
 
 	public init(key: NostrKey, relays: [RelayClient], store: ChangeStore, keyring: SpaceKeyring = KeychainSpaceKeyring()) {
 		self.key = key
@@ -137,6 +140,16 @@ public actor Backend {
 
 	/// Recomputes dirty object states; an object whose change count did not grow keeps its cached replay.
 	func ensure() async throws {
+		if let rebuilding { return try await rebuilding.value }
+		let work = Task {
+			defer { rebuilding = nil }
+			repeat { try await rebuildStates() } while allDirty || !dirty.isEmpty
+		}
+		rebuilding = work
+		try await work.value
+	}
+
+	private func rebuildStates() async throws {
 		var rebuilt = false
 		let ids: [String]
 		if allDirty {
@@ -224,6 +237,16 @@ public actor Backend {
 	/// and rotates the keyring only once the engine accepted the request; a
 	/// new channel gets its key right after its creating change.
 	public func mutate(action: String, params: JSONValue) async throws -> JSONValue {
+		let previous = mutationTail
+		let work = Task {
+			await previous?.value
+			return try await applyMutation(action: action, params: params)
+		}
+		mutationTail = Task { _ = try? await work.value }
+		return try await work.value
+	}
+
+	private func applyMutation(action: String, params: JSONValue) async throws -> JSONValue {
 		try await ensure()
 		let channelId = params["channel_id"]?.string ?? ""
 		let rotating = action == "channel_member_remove" || action == "channel_key_rotate"

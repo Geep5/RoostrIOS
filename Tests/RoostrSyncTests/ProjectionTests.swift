@@ -11,6 +11,53 @@ final class ProjectionTests: XCTestCase {
 		Backend(key: NostrKey.generate(), relays: [FakeRelay()], store: InMemoryChangeStore(), keyring: InMemorySpaceKeyring())
 	}
 
+	func testConcurrentMailboxDeliveryAndClaimAreIdempotent() async throws {
+		let backend = backend()
+		await backend.start()
+		defer { Task { await backend.stop() } }
+		let source = try await backend.createNote(name: "Sender", text: "")
+		let target = try await backend.createNote(name: "Receiver", text: "")
+		let message: JSONValue = .object([
+			"id": .string("concurrent-message"), "exchangeId": .string("concurrent-exchange"),
+			"sender": .object(["objectId": .string(source), "agentId": .string("")]),
+			"recipients": .array([.object(["objectId": .string(target), "agentId": .string("")])]),
+			"text": .string("Record this once"), "replyTo": .string(""), "sentAt": .int(100),
+			"title": .string("Concurrent delivery"), "requestReply": .bool(false),
+			"historical": .bool(false), "operation": .string(""), "author": .string(""),
+		])
+		_ = try await backend.mutate(action: "message_send", params: .object([
+			"object_id": .string(source), "message": message,
+		]))
+		try await withThrowingTaskGroup(of: Void.self) { group in
+			for _ in 0..<8 {
+				group.addTask {
+					_ = try await backend.mutate(action: "message_deliver", params: .object([
+						"sender_object_id": .string(source), "message_id": .string("concurrent-message"),
+						"recipient_object_id": .string(target),
+					]))
+				}
+			}
+			try await group.waitForAll()
+		}
+		let receiver = try await backend.object(id: target)
+		XCTAssertEqual(receiver["mailbox"]?.array?.map { $0["message"]?["text"]?.string }, ["Record this once"])
+		let claims = try await withThrowingTaskGroup(of: Bool.self, returning: Int.self) { group in
+			for index in 0..<12 {
+				group.addTask {
+					let result = try await backend.mutate(action: "message_processing", params: .object([
+						"object_id": .string(target), "message_id": .string("concurrent-message"),
+						"status": .string("processing"), "owner": .string("worker-\(index)"),
+					]))
+					return result["claimed"]?.bool == true
+				}
+			}
+			var claimed = 0
+			for try await value in group { if value { claimed += 1 } }
+			return claimed
+		}
+		XCTAssertEqual(claims, 1, "Only one worker may execute a delivered message")
+	}
+
 	func testSummariesCarryWebsiteFields() async throws {
 		let backend = backend()
 		await backend.start()

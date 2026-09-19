@@ -43,8 +43,6 @@ final class LiveWebAppTests: XCTestCase {
 		host.backend = backend
 		await backend.start()
 		let bridge = WebBridge(host: host)
-		var lines: [String] = []
-		bridge.trace = { lines.append($0) }
 		let webView = bridge.makeWebView(bundleURL: Self.bundle)
 		webView.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
 
@@ -72,10 +70,7 @@ final class LiveWebAppTests: XCTestCase {
 			if text.contains(name) { break }
 			try await Task.sleep(for: .milliseconds(200))
 		}
-		let debug = await withCheckedContinuation { (c: CheckedContinuation<String, Never>) in
-			webView.evaluateJavaScript("JSON.stringify({url: location.href, title: document.title, html: document.body.innerHTML.slice(0, 1500), errors: window.__roostrErrors || null})") { v, e in c.resume(returning: (v as? String) ?? String(describing: e)) }
-		}
-		XCTAssertTrue(text.contains(name), "page text after load:\n\(text.prefix(600))\nDEBUG \(debug)\nTRACE \(lines.joined(separator: " | "))")
+		XCTAssertTrue(text.contains(name), "page text after load:\n\(text.prefix(600))")
 		print("LIVE_WEB_APP rendered=\(text.contains(name)) chars=\(text.count)")
 		bridge.detach()
 		await backend.stop()

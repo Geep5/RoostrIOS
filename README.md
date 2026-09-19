@@ -32,7 +32,12 @@ artifacts together, as the website does with `engine.wasm`:
 node build-xcframework.mjs            # writes ../RoostrIOS/Vendor/
 ```
 
-The ABI is `core_init` once, then per call: `core_reserve(n)` → write UTF-8 JSON
+The shared ABI is version **2**. The Swift wrapper and generated artifact
+manifests must use the same version as `abi/abi.odin`; rebuild the framework
+when changing it. ABI v2 adds the optional `core_reserve_blob` side-channel;
+the Swift host continues to use JSON requests.
+
+Call `core_init` once, then per call: `core_reserve(n)` → write UTF-8 JSON
 `{method, payload}` → `core_execute()` → read `core_response_pointer/length` →
 `core_reset(0)`. `GlonCore.shared.call(method, payload)` does exactly that and
 throws `GlonError.engine(message)` for `{error}` envelopes. The engine is not

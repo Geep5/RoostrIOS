@@ -1,33 +1,38 @@
 {
-  "abiVersion": 1,
+  "abiVersion": 2,
   "compiler": "/opt/homebrew/bin/odin version dev-2026-07:819fdc7a8",
   "target": "js_wasm32",
   "artifact": "engine.wasm",
-  "sha256": "1950b81756a4ff5bb8fd093f9fdaa81eefbd09b6aee970289639f08a809da814",
-  "sourceFingerprint": "67c615a47a5c32273eaf6aade944e5fa04a38c4d0ff0b427eed7817b816935c8",
+  "sha256": "5decbf752a0c084edee189743e7e04a4fbbda69fb098bea14a9b3e581d4c9457",
+  "sourceFingerprint": "ff40f7dc7177d89518dc53e55c1c80e8bf81c784a9f275cdc003ca1e2843549e",
   "sourceFiles": {
-    "abi/abi.odin": "d4d2b2b0adac2067d0c6b669993490b1716537b96831300064af6e7b2646c283",
+    "abi/abi.odin": "8c81cc5b058d4b764a649591a4061586fcd9471e7997ec73a6a48d918b81ca28",
+    "core/agent_message.odin": "537af63c3be51ffcf0b4ed3be1ce2e59a9a2fddeb39ae11ee0e649cd900a0cfa",
     "core/authority.odin": "0b3a09dffef10323c96e1dbd82bfccc28feab32d8b0c88e899ac9cb2c08a1764",
     "core/bech32.odin": "5c99ff01ca2bdda79a0e4e0b775744150093583d00f07f9b0668ab27963d1c8c",
     "core/codec_json.odin": "e9e5e0ca74dd8e54e7772288dc67629731f1b68fccbc2d2b8e0b728d41fca82a",
+    "core/conversation.odin": "3524f98b9be8fd2410c7e235ce97a544169ed3bee338e3de145a7b17269620d3",
+    "core/corpus.odin": "45b97114d2e4687cae8a6f0185aab3442969473f356f51d333f411399d878876",
     "core/dag.odin": "ada8d08dfb4ca83c1946947d67220a065f2121ce156618c23c028cfe5621014f",
-    "core/dispatch.odin": "4c24c0a0e6f6956709a4688e1409c634c7fd5f041b7439bb77b3254443b49974",
-    "core/jsonx.odin": "46f5d6fd05b572c8023b77e58f0a31205551281de4d59dca78961301ca7f4d39",
-    "core/mutate.odin": "480960899c4d1eecb4ea004c8ff87f980f68ca9f34ebb21d59ed1c2c49838e96",
+    "core/descriptor.odin": "04580da1ebfd715559f9dcdc87f57ce3399d769c025d6988744c7f416919eabf",
+    "core/descriptor_json.odin": "3dc7c9825a7ed506c90c252467c648eaa7e0667f0298a33312b4907e351b73df",
+    "core/dispatch.odin": "45f0973dd1a1c22079e73e52417f658bb36e2c9cac9960c6c95362541e5d95ed",
+    "core/jsonx.odin": "c036c957ef7209aabae3b9addc319125095bc1b3d8183e4d34e1777e21f0a5ce",
+    "core/mutate.odin": "4237cfd1545f7b930703de44c7ad2526faaa8ec5ec0a1a5f2a360a371ecd3d86",
     "core/nip44.odin": "71412d79e95596ecf93c1ffb11909824bb6b44c1bd3fea3ca9c351a46fed9e82",
     "core/proto.odin": "fa914e2ba4c4e404ba89c8427381601fb8832049b82b754ada76ae7948528791",
     "core/query.odin": "e9a5aa5783640a6c0d8868f15486a31ed0767adff6628c53a157e7dd361c85ca",
     "core/repeat.odin": "7236b71cfd12b953de66f692341c88276667713d8f3162a71730f5524971247b",
     "core/replay.odin": "d9a320dda1ccaa217bbcd5ca33c1b129f586456e79908694d3d2c58c59e1a4e5",
-    "core/serving.odin": "215d6560b6d176ada1c5d68d883b4e9cc28a80722d979c46debe07cabcf6f08b",
+    "core/serving.odin": "56f56f6192d1703883fc38b014510401fa0e5a36415a59242652f957c84c429a",
     "core/sync_outbox.odin": "302aca2530f9e001ca847a32aeb2fd94d0ac9f3f0ff9d92caf138b2cf99a4190",
     "core/sync_session.odin": "c59f4041cdd3acf37265f01a9dbc60408744fb61192d2d0140276412fcbf6678",
     "core/wire.odin": "10ec9599e87db0e74659c8babd6d35d6fff000ca9a9f4771ee9850b8e819d59f",
     "wasm/main.odin": "007614b554da7e706c3f2740338357df67ba9f83bfe40c89d2021e0343359474",
-    "build-wasm.mjs": "7f230f2118be60eac27e57272a8461d33e338d3aef55a9a6af289fa3404d79ff"
+    "build-wasm.mjs": "4b3a6ffd20f1281afe4b6c09ebff6b50940fc5eea6c04b8949c60734e108ff76"
   },
   "runtimeFiles": {
-    "src/lib/engine/core.ts": "27c1d8f6ed955171113e199851bfd36b6273406cbcb09a451c6711367faa8a06",
+    "src/lib/engine/core.ts": "f1fe138c99ba6deb76d9fe9067e3386c61d1a88aecd6234ab85567dfb8ea6496",
     "src/lib/engine/odin-runtime.ts": "d3c8f6456b7b833a6cf4d71a7767c000e669697bfd2c8ba0c23845c1ac4df122"
   }
 }

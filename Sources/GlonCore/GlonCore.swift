@@ -15,7 +15,7 @@ public enum GlonError: Error, Equatable {
 /// Serialises every call into the single-flight Odin engine. One instance per
 /// process; the engine's query cache is process-global state behind this actor.
 public actor GlonCore {
-	public static let abiVersion: UInt32 = 1
+	public static let abiVersion: UInt32 = 2
 	public static let requestLimit = 16 * 1024 * 1024
 	public static let shared = GlonCore()
 
