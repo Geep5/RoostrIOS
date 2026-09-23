@@ -16,9 +16,10 @@ public struct StoreError: Error, CustomStringConvertible, Sendable {
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-/// `ChangeStore` over the system SQLite. Two tables mirror the browser's
-/// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order)
-/// and `meta` (string key/value). Statements are prepared once and reused.
+/// `ChangeStore` over the system SQLite. Three tables mirror the browser's
+/// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order),
+/// `checkpoints` (one per object) and `meta` (string key/value). Statements are
+/// prepared once and reused.
 public actor SQLiteChangeStore: ChangeStore {
 	private var db: OpaquePointer?
 	private var statements: [String: OpaquePointer] = [:]
@@ -48,6 +49,15 @@ public actor SQLiteChangeStore: ChangeStore {
 				""")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS changes_object_id ON changes(object_id, seq)")
 			try Self.exec(opened, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+			try Self.exec(opened, """
+				CREATE TABLE IF NOT EXISTS checkpoints (
+					object_id TEXT PRIMARY KEY,
+					bytes BLOB NOT NULL,
+					hash TEXT NOT NULL,
+					heads TEXT NOT NULL,
+					covered INTEGER NOT NULL
+				)
+				""")
 		} catch {
 			sqlite3_close(opened)
 			throw error
@@ -109,12 +119,67 @@ public actor SQLiteChangeStore: ChangeStore {
 	}
 
 	public func objectIds() async throws -> [String] {
-		let select = try statement("SELECT object_id FROM changes GROUP BY object_id ORDER BY MIN(seq)")
+		let select = try statement("""
+			SELECT object_id FROM (
+				SELECT object_id, MIN(seq) AS first FROM changes GROUP BY object_id
+				UNION SELECT object_id, NULL FROM checkpoints WHERE object_id NOT IN (SELECT object_id FROM changes)
+			) ORDER BY first IS NULL, first
+			""")
 		try reset(select)
 		var ids: [String] = []
 		while try stepRow(select) { ids.append(columnText(select, 0)) }
 		sqlite3_reset(select)
 		return ids
+	}
+
+	// MARK: checkpoints
+
+	public func checkpoint(objectId: String) async throws -> CheckpointRecord? {
+		let select = try statement("SELECT bytes, hash, heads, covered FROM checkpoints WHERE object_id = ?")
+		try reset(select)
+		try bind(select, 1, objectId)
+		defer { sqlite3_reset(select) }
+		guard try stepRow(select) else { return nil }
+		let heads = try decoder.decode([String].self, from: Data(columnText(select, 2).utf8))
+		return CheckpointRecord(objectId: objectId, bytes: columnBlob(select, 0), hash: columnText(select, 1), heads: heads, covered: Int(sqlite3_column_int64(select, 3)))
+	}
+
+	public func putCheckpoint(_ record: CheckpointRecord) async throws -> Bool {
+		try transaction {
+			if let existing = try checkpointMeta(record.objectId),
+			   !(record.covered > existing.covered || (record.covered == existing.covered && record.hash > existing.hash)) {
+				return false
+			}
+			let upsert = try statement("INSERT OR REPLACE INTO checkpoints (object_id, bytes, hash, heads, covered) VALUES (?, ?, ?, ?, ?)")
+			try reset(upsert)
+			try bind(upsert, 1, record.objectId)
+			try bind(upsert, 2, record.bytes)
+			try bind(upsert, 3, record.hash)
+			try bind(upsert, 4, String(decoding: try encoder.encode(record.heads), as: UTF8.self))
+			guard sqlite3_bind_int64(upsert, 5, Int64(record.covered)) == SQLITE_OK else { throw error(SQLITE_ERROR) }
+			try stepDone(upsert)
+			return true
+		}
+	}
+
+	private func checkpointMeta(_ objectId: String) throws -> (covered: Int, hash: String)? {
+		let select = try statement("SELECT covered, hash FROM checkpoints WHERE object_id = ?")
+		try reset(select)
+		try bind(select, 1, objectId)
+		defer { sqlite3_reset(select) }
+		guard try stepRow(select) else { return nil }
+		return (Int(sqlite3_column_int64(select, 0)), columnText(select, 1))
+	}
+
+	public func checkpointFloors() async throws -> [String: Int64] {
+		guard let raw = try meta("checkpoint-floors") else { return [:] }
+		return try decoder.decode([String: Int64].self, from: Data(raw.utf8))
+	}
+
+	public func setCheckpointFloor(scope: String, _ floor: Int64) async throws {
+		var floors = try await checkpointFloors()
+		floors[scope] = floor
+		try setMeta("checkpoint-floors", String(decoding: try encoder.encode(floors), as: UTF8.self))
 	}
 
 	// MARK: meta

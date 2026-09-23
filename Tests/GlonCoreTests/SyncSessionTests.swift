@@ -175,7 +175,7 @@ final class SyncSessionTests: XCTestCase {
 		XCTAssertEqual(item["change"]?["objectId"]?.string, "big-1")
 		let gid = try XCTUnwrap(chunkTag(events[1], 1), "chunk parts carry a c tag")
 		let chunkKey = try XCTUnwrap(item["chunkKey"]?.string)
-		XCTAssertEqual(chunkKey, "[\"\(Self.writer)\",\"space-1\",1,\"\(gid)\"]")
+		XCTAssertEqual(chunkKey, "[\"\(Self.writer)\",\"space-1\",1,\"\(gid)\",1078]", "groups are keyed by kind so retire can tell checkpoints from changes")
 		XCTAssertEqual(item["provenance"], .object(["spaceId": .string("space-1"), "keyId": .int(1), "signer": .string(Self.writer)]))
 		state = try await sync("state")
 		XCTAssertEqual(state["groups"]?.int, 0, "completed group is released")

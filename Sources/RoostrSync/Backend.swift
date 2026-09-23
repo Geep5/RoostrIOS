@@ -22,7 +22,15 @@ let vanishLogId = "__vanished__"
 public actor Backend {
 	struct Cached {
 		let changeCount: Int
+		/// Checkpoint hash the state was replayed on top of; "" for none. Replacing
+		/// 500 changes with one checkpoint must not read as "count unchanged".
+		let checkpointHash: String
 		let state: JSONValue
+	}
+
+	/// Test hook: `"<changeCount>:<checkpointHash>"` the cached state was replayed under.
+	func cachedSignature(id: String) -> String? {
+		states[id].map { "\($0.changeCount):\($0.checkpointHash)" }
 	}
 
 	let key: NostrKey
@@ -163,11 +171,13 @@ public actor Backend {
 		}
 		for id in ids {
 			let changes = try await store.changesFor(objectId: id)
-			if changes.isEmpty { states[id] = nil; continue }
-			if let hit = states[id], hit.changeCount == changes.count { continue }
+			let checkpoint = try await store.checkpoint(objectId: id)
+			if changes.isEmpty && checkpoint == nil { states[id] = nil; continue }
+			let hash = checkpoint?.hash ?? ""
+			if let hit = states[id], hit.changeCount == changes.count, hit.checkpointHash == hash { continue }
 			do {
-				if let state = try await Engine.replay(changes.map(\.json)) {
-					states[id] = Cached(changeCount: changes.count, state: state)
+				if let state = try await Engine.replay(changes.map(\.json), checkpoint: checkpoint?.bytes) {
+					states[id] = Cached(changeCount: changes.count, checkpointHash: hash, state: state)
 				}
 			} catch {
 				// One malformed legacy object must never brick the vault.
@@ -298,7 +308,8 @@ public actor Backend {
 	private func commit(_ planned: JSONValue) async throws {
 		guard var fields = planned.object, let objectId = fields["objectId"]?.string else { throw BackendError.malformedPlan("change without objectId") }
 		let history = try await store.changesFor(objectId: objectId)
-		fields["parentIds"] = .array(try await Engine.heads(history.map(\.json)).map(JSONValue.string))
+		let checkpoint = try await store.checkpoint(objectId: objectId)
+		fields["parentIds"] = .array(try await Engine.heads(history.map(\.json), checkpoint: checkpoint?.bytes).map(JSONValue.string))
 		let bytes = try await Engine.encode(.object(fields))
 		// Round-trip through decode so the stored JSON matches relay-imported changes byte for byte.
 		let decoded = try await Engine.decode(bytes)

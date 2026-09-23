@@ -29,7 +29,7 @@ final class ServingContractTests: XCTestCase {
 
 	func testResolve() async throws {
 		let fixtures = Self.fixtures.resolve
-		XCTAssertEqual(fixtures.count, 12)
+		XCTAssertEqual(fixtures.count, 14)
 		for fixture in fixtures {
 			guard case .object(var fields) = fixture, let name = fields["name"]?.string else { continue }
 			let expected = fields["expected"]

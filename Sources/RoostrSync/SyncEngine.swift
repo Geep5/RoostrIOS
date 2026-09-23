@@ -46,9 +46,14 @@ private struct SharedSpace: Sendable, Equatable {
 	let spaceTag: String
 }
 
+/// One decrypted relay payload: a change (kind 1078) or a checkpoint (kind 1079).
 private struct ImportItem: Sendable {
+	let objectId: String
 	let bytes: Data
-	let change: JSONValue
+	/// `bytes` as the core handed them over; the checkpoint gate takes them back verbatim.
+	let base64: String
+	let change: JSONValue?
+	let checkpoint: CheckpointSummary?
 	let chunkKey: String?
 	let provenance: SharedProvenance?
 }
@@ -89,6 +94,9 @@ public actor SyncEngine {
 	private var activeLiveEvents = 0
 	private var activeImports = 0
 	private var importedCount = 0
+	private var checkpointCount = 0
+	/// Publisher manifest cursors resolved this process, per scope ("" personal, else space tag).
+	private var floorCache: [String: Int64] = [:]
 	/// Mirror of the outbox's queued-not-in-flight count, for the status.
 	private var pendingCount = 0
 	private var queueRunning = false
@@ -145,6 +153,10 @@ public actor SyncEngine {
 		let bootstrapped = (try? await store.bootstrapped()) ?? false
 		let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
 		let since: Int64 = bootstrapped ? cursor + 1 : 1
+		// An unbootstrapped device subscribes live from the publisher's floor,
+		// not from zero: otherwise the live stream replays the whole vault the
+		// walk deliberately skipped (docs/checkpoint-sync.md).
+		if !bootstrapped { await resolveFloors() }
 		activeWalks += 1
 		walkTask = Task { await self.bootstrap(since: since, resumeUntil: floor, markBootstrapped: !bootstrapped) }
 		if stopped { return }
@@ -173,9 +185,10 @@ public actor SyncEngine {
 		wrapSinks.removeAll()
 	}
 
-	/// Test helper: resolves when no walk, import, live event or publish is in flight.
+	/// Test helper: resolves when no walk, import, live event, publish or
+	/// debounced object notification is in flight.
 	public func awaitIdle() async {
-		while activeWalks > 0 || activeImports > 0 || activeLiveEvents > 0 || queueRunning {
+		while activeWalks > 0 || activeImports > 0 || activeLiveEvents > 0 || queueRunning || notifyTask != nil {
 			try? await Task.sleep(for: .milliseconds(20))
 		}
 	}
@@ -259,7 +272,8 @@ public actor SyncEngine {
 	}
 
 	private func statusDetail() -> String? {
-		historyComplete ? nil : "verifying full history in background · \(importedCount) changes so far"
+		if historyComplete { return nil }
+		return "verifying full history in background · \(importedCount) changes\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
 	}
 
 	private func emitLiveStatus() {
@@ -317,8 +331,19 @@ public actor SyncEngine {
 		let checkpoint = replayFaultGeneration
 		await persistCursor()
 
-		var filters = [NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)]
-		for space in spaces.values { filters.append(NostrFilter(kinds: [Engine.changeKind], since: since, tagged: ["h": [space.spaceTag]])) }
+		// A full walk pulls kind-1078 only from the publisher's manifest cursor
+		// on: everything older is folded into a kind-1079 checkpoint, which is
+		// walked unbounded. Resolved once per scope and remembered, so a later
+		// repair walk never widens back to event zero.
+		let full = since <= 1
+		var filters = [
+			NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: full ? max(since, await checkpointFloor(scope: "", space: nil)) : since),
+			NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since),
+		]
+		for space in spaces.values {
+			filters.append(NostrFilter(kinds: [Engine.changeKind], since: full ? max(since, await checkpointFloor(scope: space.spaceTag, space: space)) : since, tagged: ["h": [space.spaceTag]]))
+			filters.append(NostrFilter(kinds: [Engine.checkpointKind], since: since, tagged: ["h": [space.spaceTag]]))
+		}
 		var byId: [String: NostrEvent] = [:]
 		var complete = !relays.isEmpty
 		await withTaskGroup(of: (events: [NostrEvent], complete: Bool).self) { group in
@@ -334,11 +359,26 @@ public actor SyncEngine {
 		}
 
 		var batch: [ImportItem] = []
-		let ordered = byId.values.sorted { $0.created_at != $1.created_at ? $0.created_at < $1.created_at : $0.id < $1.id }
+		// Checkpoints first within a second: a change the checkpoint already
+		// folds in then lands as covered tail, never as a solitary orphan.
+		let ordered = byId.values.sorted {
+			if $0.created_at != $1.created_at { return $0.created_at < $1.created_at }
+			if $0.kind != $1.kind { return $0.kind > $1.kind }
+			return $0.id < $1.id
+		}
 		for event in ordered {
-			if let item = try await eventToChange(event) { batch.append(item) }
+			if let item = try await ingest(event) { batch.append(item) }
 		}
 		try await importBatch(batch, immediateNotify: true)
+		// Every relay answered for every filter and nothing faulted: a
+		// CHECKPOINT group still open is missing parts no relay holds (NIP-09
+		// took a superseded checkpoint's chunks; the newer one covers the
+		// object). The core retires only those - a change group stays until a
+		// covering repair, since a missing change is missing data.
+		if complete && !stopped && replayFaultGeneration == checkpoint && sessionOpen {
+			let r: SettleResult? = try? await Engine.sync("retire", ["since": .int(full ? 0 : since)])
+			if let groups = r?.replayGroups { mirror(groups) }
+		}
 
 		historyComplete = complete && !stopped && replayGroups.isEmpty && activeLiveEvents == 0 && activeImports == 0 &&
 			replayFaultGeneration == checkpoint && since <= (discardedChunkFloor ?? Int64.max)
@@ -388,7 +428,44 @@ public actor SyncEngine {
 		}
 	}
 
-	// ── Event → change ──
+	// ── Checkpoint manifest ──
+
+	/// Publisher's manifest cursor for a scope, resolved once per process and
+	/// persisted. No manifest → 0: that scope walks from genesis (today's behaviour).
+	private func checkpointFloor(scope: String, space: SharedSpace?) async -> Int64 {
+		if let cached = floorCache[scope] { return cached }
+		let floor = await fetchManifest(space) ?? 0
+		floorCache[scope] = floor
+		if floor > 0 { try? await store.setCheckpointFloor(scope: scope, floor) }
+		return floor
+	}
+
+	private func resolveFloors() async {
+		if let persisted = try? await store.checkpointFloors() { for (scope, floor) in persisted where floorCache[scope] == nil { floorCache[scope] = floor } }
+		_ = await checkpointFloor(scope: "", space: nil)
+		for space in spaces.values { _ = await checkpointFloor(scope: space.spaceTag, space: space) }
+	}
+
+	/// Newest kind-30079 manifest cursor for a scope. Personal: ours, self-sealed.
+	/// Shared: the space owner's, sealed under the space key.
+	private func fetchManifest(_ space: SharedSpace?) async -> Int64? {
+		let author = space?.info.owner ?? pk
+		let d = space.map { "\(Engine.manifestTag)/\($0.spaceTag)" } ?? Engine.manifestTag
+		let events = await query([NostrFilter(authors: [author], kinds: [Engine.manifestKind], tagged: ["d": [d]])], timeout: Self.queryTimeout)
+		let conversationKey: String
+		if let keyHex = space?.info.keyHex { conversationKey = keyHex }
+		else if let derived = try? await Engine.conversationKey(sharedX: try key.sharedX(with: pk)) { conversationKey = derived }
+		else { return nil }
+		for event in events.sorted(by: { $0.created_at > $1.created_at }) where NostrKey.verify(event) {
+			guard let plain = try? await Engine.decrypt(event.content, conversationKey: conversationKey),
+			      let parsed = try? JSONDecoder().decode(JSONValue.self, from: Data(plain.utf8)),
+			      let cursor = parsed["cursor"]?.int, cursor >= 0 else { continue }
+			return cursor
+		}
+		return nil
+	}
+
+	// ── Event → change / checkpoint ──
 
 	private static func eventJSON(_ event: NostrEvent) -> JSONValue {
 		.object([
@@ -401,9 +478,9 @@ public actor SyncEngine {
 	}
 
 	/// Feed one signature-verified relay event to the session; returns the
-	/// decoded change when a full change (possibly reassembled) is available.
-	private func eventToChange(_ event: NostrEvent) async throws -> ImportItem? {
-		guard event.kind == Engine.changeKind, NostrKey.verify(event) else { return nil }
+	/// decoded payload when a full change or checkpoint (possibly reassembled) is available.
+	private func ingest(_ event: NostrEvent) async throws -> ImportItem? {
+		guard event.kind == Engine.changeKind || event.kind == Engine.checkpointKind, NostrKey.verify(event) else { return nil }
 		guard sessionOpen else { return nil } // stopped or retired
 		let r: IngestResult = try await Engine.sync("ingest", ["event": Self.eventJSON(event), "nowMs": .int(Self.nowMs())])
 		cursor = r.cursor
@@ -411,7 +488,11 @@ public actor SyncEngine {
 		if let groups = r.replayGroups { mirror(groups) }
 		guard let item = r.item else { return nil }
 		guard let bytes = Data(base64Encoded: item.bytes) else { throw SyncError.malformedChange }
-		return ImportItem(bytes: bytes, change: item.change, chunkKey: item.chunkKey, provenance: item.provenance)
+		let objectId: String
+		if let checkpoint = item.checkpoint { objectId = checkpoint.objectId }
+		else if let id = item.change?["objectId"]?.string { objectId = id }
+		else { throw SyncError.malformedChange }
+		return ImportItem(objectId: objectId, bytes: bytes, base64: item.bytes, change: item.change, checkpoint: item.checkpoint, chunkKey: item.chunkKey, provenance: item.provenance)
 	}
 
 	/// Report a reassembled group's import outcome to the session.
@@ -466,33 +547,55 @@ public actor SyncEngine {
 		return failure
 	}
 
-	/// Stores one change unless the authority gate refuses it (false).
+	/// Stores one change or checkpoint unless the authority gate refuses it (false).
 	private func importOne(_ item: ImportItem, settled: inout Set<String>) async throws -> Bool {
-		guard let objectId = item.change["objectId"]?.string, let id = item.change["id"]?.string else { throw SyncError.malformedChange }
-		if let provenance = item.provenance {
-			// The installed key version and its administrator (the keyring's
-			// owner, else this identity) decide; a rotated keyId is refused.
-			guard let space = spaces[provenance.spaceId]?.info else { return false }
-			let trustedSpace = try await Engine.replay(try await store.changesFor(objectId: provenance.spaceId).map(\.json))
-			let existing = try await Engine.replay(try await store.changesFor(objectId: objectId).map(\.json))
-			let verdict: AuthorizeResult = try await Engine.sync("authorize", [
-				"change": item.change,
-				"provenance": .object(["spaceId": .string(provenance.spaceId), "keyId": .int(provenance.keyId), "signer": .string(provenance.signer)]),
-				"space": .object(["spaceId": .string(space.spaceId), "keyId": .int(space.keyId), "owner": .string(space.owner ?? pk)]),
-				"trustedSpace": trustedSpace ?? .null,
-				"existing": existing ?? .null,
-			])
-			if !verdict.ok { return false }
+		if let provenance = item.provenance, !(try await authorized(item, provenance)) { return false }
+		if let checkpoint = item.checkpoint {
+			// Keep a checkpoint when it beats the one held (more covered, then
+			// hash). A superseded copy is still a clean import: re-scanning
+			// would only produce it again.
+			let record = CheckpointRecord(objectId: item.objectId, bytes: item.bytes, hash: checkpoint.hash, heads: checkpoint.headIds.sorted(), covered: checkpoint.covered)
+			if try await store.putCheckpoint(record) {
+				checkpointCount += 1
+				pendingObjects.insert(item.objectId)
+			}
+		} else {
+			guard let change = item.change, let id = change["id"]?.string else { throw SyncError.malformedChange }
+			importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: item.objectId, bytes: item.bytes, json: change)])
+			let publishKey = item.provenance.map { "\($0.spaceId)/\($0.keyId)/\(id)" } ?? id
+			try await store.markPublished(key: publishKey)
+			pendingObjects.insert(item.objectId)
 		}
-		importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: item.bytes, json: item.change)])
-		let publishKey = item.provenance.map { "\($0.spaceId)/\($0.keyId)/\(id)" } ?? id
-		try await store.markPublished(key: publishKey)
 		if let chunkKey = item.chunkKey {
 			settled.insert(chunkKey)
 			await settle(chunkKey, imported: true)
 		}
-		pendingObjects.insert(objectId)
 		return true
+	}
+
+	/// The installed key version and its administrator (the keyring's owner,
+	/// else this identity) decide; a rotated keyId is refused. A checkpoint
+	/// bypasses per-op authority, so only the space owner may publish one.
+	private func authorized(_ item: ImportItem, _ provenance: SharedProvenance) async throws -> Bool {
+		guard let space = spaces[provenance.spaceId]?.info else { return false }
+		let trustedSpace = try await replayStored(provenance.spaceId)
+		let existing = try await replayStored(item.objectId)
+		var payload: [String: JSONValue] = [
+			"provenance": .object(["spaceId": .string(provenance.spaceId), "keyId": .int(provenance.keyId), "signer": .string(provenance.signer)]),
+			"space": .object(["spaceId": .string(space.spaceId), "keyId": .int(space.keyId), "owner": .string(space.owner ?? pk)]),
+			"trustedSpace": trustedSpace ?? .null,
+			"existing": existing ?? .null,
+		]
+		if item.checkpoint != nil { payload["checkpoint"] = .string(item.base64) } else { payload["change"] = item.change ?? .null }
+		let verdict: AuthorizeResult = try await Engine.sync(item.checkpoint != nil ? "authorizeCheckpoint" : "authorize", payload)
+		return verdict.ok
+	}
+
+	/// Current state of a stored object: its checkpoint (if any) plus the tail.
+	private func replayStored(_ objectId: String) async throws -> JSONValue? {
+		let changes = try await store.changesFor(objectId: objectId).map(\.json)
+		let checkpoint = try await store.checkpoint(objectId: objectId)
+		return try await Engine.replay(changes, checkpoint: checkpoint?.bytes)
 	}
 
 	private func recordReplayFault(_ at: Int64) async {
@@ -532,7 +635,7 @@ public actor SyncEngine {
 
 	private func subscribeLive() {
 		liveTask?.cancel()
-		let since = cursor + 1
+		let since = liveSince()
 		let tags = spaces.values.map(\.spaceTag)
 		liveTask = Task {
 			await withTaskGroup(of: Void.self) { group in
@@ -544,10 +647,19 @@ public actor SyncEngine {
 		liveUp = true
 	}
 
-	/// Personal changes, every installed space's stream, and gift wraps for us.
+	/// `max(cursor + 1, min floor of the covered scopes)`: nothing that can still
+	/// arrive live sits below a publisher's floor (every 1079 of a pass is newer).
+	private func liveSince() -> Int64 {
+		var floor: Int64? = floorCache[""]
+		for space in spaces.values { floor = min(floor ?? Int64.max, floorCache[space.spaceTag] ?? 0) }
+		return max(cursor + 1, floor ?? 0)
+	}
+
+	/// Personal changes and checkpoints, every installed space's stream, and gift wraps for us.
 	private func liveFilters(since: Int64, spaceTags: [String]) -> [NostrFilter] {
-		var filters = [NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)]
-		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: [Engine.changeKind], since: since, tagged: ["h": spaceTags])) }
+		let kinds = [Engine.changeKind, Engine.checkpointKind]
+		var filters = [NostrFilter(authors: [pk], kinds: kinds, since: since)]
+		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: kinds, since: since, tagged: ["h": spaceTags])) }
 		filters.append(NostrFilter(kinds: [giftWrapKind], since: Int64(Date().timeIntervalSince1970) - wrapLookbackSeconds, tagged: ["p": [pk]]))
 		return filters
 	}
@@ -574,7 +686,7 @@ public actor SyncEngine {
 			if stopped || Task.isCancelled { return }
 			try? await Task.sleep(for: backoff)
 			backoff = min(backoff * 2, Self.liveBackoffCeiling)
-			since = cursor + 1
+			since = liveSince()
 			reconnecting = true
 		}
 	}
@@ -636,7 +748,7 @@ public actor SyncEngine {
 	private func handleLiveEvent(_ event: NostrEvent) async {
 		activeLiveEvents += 1
 		do {
-			if let item = try await eventToChange(event) { try await importBatch([item], immediateNotify: false) }
+			if let item = try await ingest(event) { try await importBatch([item], immediateNotify: false) }
 		} catch {
 			await recordReplayFault(1)
 			emit(SyncStatus(phase: .error, imported: importedCount, pending: pendingCount, detail: "\(error)"))

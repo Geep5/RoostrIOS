@@ -35,10 +35,20 @@ public struct SharedProvenance: Decodable, Sendable, Equatable {
 	public let signer: String
 }
 
+/// A reassembled kind-1079 payload as the session summarizes it (bytes stay opaque).
+public struct CheckpointSummary: Decodable, Sendable, Equatable {
+	public let objectId: String
+	public let headIds: [String]
+	public let covered: Int
+	public let hash: String
+}
+
+/// One decrypted relay payload: a change (kind 1078) or a checkpoint (kind 1079).
 public struct IngestItem: Decodable, Sendable {
-	/// Base64 wire bytes of the full change.
+	/// Base64 wire bytes of the full change or checkpoint.
 	public let bytes: String
-	public let change: JSONValue
+	public let change: JSONValue?
+	public let checkpoint: CheckpointSummary?
 	public let chunkKey: String?
 	public let provenance: SharedProvenance?
 }
@@ -119,6 +129,11 @@ public struct MutationPlan: Decodable, Sendable {
 
 public enum Engine {
 	public static let changeKind = 1078
+	/// One sealed Checkpoint protobuf per object (docs/checkpoint-sync.md).
+	public static let checkpointKind = 1079
+	/// Replaceable manifest the publisher stamps once every object is covered.
+	public static let manifestKind = 30079
+	public static let manifestTag = "roostr-checkpoint"
 
 	static func call<R: Decodable>(_ method: String, _ payload: [String: JSONValue]) async throws -> R {
 		try await GlonCore.shared.call(method, JSONValue.object(payload))
@@ -144,15 +159,20 @@ public enum Engine {
 
 	// ── replay / mutation ──
 
-	/// Replayed ObjectJSON (plain maps), or nil when there are no changes.
-	public static func replay(_ changes: [JSONValue]) async throws -> JSONValue? {
-		if changes.isEmpty { return nil }
-		return try await call("replay", ["changes": .array(changes)])
+	/// Replayed ObjectJSON (plain maps), or nil when there is nothing to replay.
+	/// A checkpoint seeds the state; changes it covers are skipped, the rest replayed.
+	public static func replay(_ changes: [JSONValue], checkpoint: Data? = nil) async throws -> JSONValue? {
+		if changes.isEmpty && checkpoint == nil { return nil }
+		var payload: [String: JSONValue] = ["changes": .array(changes)]
+		if let checkpoint { payload["checkpoint"] = .string(checkpoint.base64EncodedString()) }
+		return try await call("replay", payload)
 	}
 
-	/// Head change ids: changes no other change lists as a parent.
-	public static func heads(_ changes: [JSONValue]) async throws -> [String] {
-		try await call("mutation", ["action": .string("heads"), "changes": .array(changes)])
+	/// Head change ids: changes no other change lists as a parent, plus checkpoint heads nothing built on.
+	public static func heads(_ changes: [JSONValue], checkpoint: Data? = nil) async throws -> [String] {
+		var payload: [String: JSONValue] = ["action": .string("heads"), "changes": .array(changes)]
+		if let checkpoint { payload["checkpoint"] = .string(checkpoint.base64EncodedString()) }
+		return try await call("mutation", payload)
 	}
 
 	public static func mutation(action: String, params: JSONValue, objects: [JSONValue], timestamp: Int64, author: String, idSeed: String, keyId: Int64) async throws -> MutationPlan {

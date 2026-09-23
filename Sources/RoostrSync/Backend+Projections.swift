@@ -21,30 +21,31 @@ public enum LogoutError: Error, CustomStringConvertible, Equatable {
 /// Mirror of `query.ts`'s module state. The engine's query cache is
 /// process-global (one `GlonCore`), so the host-side signature snapshot that
 /// diffs against it is too; a different `Backend` instance is a different
-/// vault and forces `reset`. Signatures are change counts: `ensure()` only
-/// replaces a state when its change count grew, and vanished ids leave `states`.
+/// vault and forces `reset`. A signature is the change count plus the checkpoint
+/// hash: `ensure()` only replaces a state when one of them moved, and vanished ids leave `states`.
 private final class QuerySignatures: @unchecked Sendable {
 	static let shared = QuerySignatures()
 	private let lock = NSLock()
 	private var owner: ObjectIdentifier?
-	private var signatures: [String: Int] = [:]
+	private var signatures: [String: String] = [:]
 
 	struct Diff {
 		let upserts: [JSONValue]
 		let removed: [String]
 		let reset: Bool
-		let next: [String: Int]
+		let next: [String: String]
 	}
 
 	func diff(owner: ObjectIdentifier, states: [String: Backend.Cached]) -> Diff {
 		lock.withLock {
 			let reset = self.owner != owner
-			var next: [String: Int] = [:]
+			var next: [String: String] = [:]
 			next.reserveCapacity(states.count)
 			var upserts: [JSONValue] = []
 			for (id, cached) in states {
-				next[id] = cached.changeCount
-				if reset || signatures[id] != cached.changeCount { upserts.append(cached.state) }
+				let signature = "\(cached.changeCount):\(cached.checkpointHash)"
+				next[id] = signature
+				if reset || signatures[id] != signature { upserts.append(cached.state) }
 			}
 			var removed: [String] = []
 			if !reset {
@@ -73,7 +74,7 @@ private func items(_ fields: JSONValue?, _ key: String) -> [JSONValue] {
 
 extension Backend {
 	/// The Odin server's GET /api/objects summary exclusions, verbatim.
-	static let hiddenListTypes: Set<String> = ["program", "typescript", "json", "proto", "relation", "channel", "skill", "peer", "pinned_fact", "milestone", "agent", "vanish_log"]
+	static let hiddenListTypes: Set<String> = ["program", "typescript", "json", "proto", "relation", "channel", "skill", "peer", "pinned_fact", "milestone", "descriptor", "install", "vanish_log"]
 
 	/// `fetchObjects`: website `ObjectSummary[]`, newest first.
 	public func summaries() async throws -> [JSONValue] {

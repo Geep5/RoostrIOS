@@ -112,8 +112,8 @@ final class SyncEngineTests: XCTestCase {
 		let live = try XCTUnwrap(relay.subscribeFilters.last { $0.authors != nil })
 		XCTAssertEqual(live.since, cursor + 1)
 		XCTAssertEqual(live.authors, [key.pubkey])
-		XCTAssertEqual(live.kinds, [1078])
-		let walk = try XCTUnwrap(relay.queryFilters.last { $0.authors != nil })
+		XCTAssertEqual(live.kinds, [1078, 1079], "live carries changes and checkpoints")
+		let walk = try XCTUnwrap(relay.queryFilters.last { $0.authors != nil && $0.kinds == [1078] })
 		XCTAssertEqual(walk.since, cursor + 1)
 		await second.stop()
 	}

@@ -104,4 +104,9 @@ extension Engine {
 	static func blind(keyHex: String, id: String) async throws -> String {
 		try await call("wire", ["action": .string("blind"), "keyHex": .string(keyHex), "id": .string(id)])
 	}
+
+	/// Personal blinded tag: sha256 of the secret's hex text || id, first 16 hex.
+	static func blind(secretHex: String, id: String) async throws -> String {
+		try await call("wire", ["action": .string("blind"), "secret": .string(secretHex), "id": .string(id)])
+	}
 }

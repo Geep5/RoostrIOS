@@ -99,13 +99,36 @@ public struct PendingPublish: Codable, Sendable, Equatable {
 	}
 }
 
+/// One object's stored checkpoint (kind 1079): computed state plus the change
+/// ids it folds in. `hash` and `covered` decide supersession; never a timestamp.
+public struct CheckpointRecord: Sendable, Equatable {
+	public let objectId: String
+	public let bytes: Data
+	public let hash: String
+	/// Sorted head change ids at checkpoint time.
+	public let heads: [String]
+	public let covered: Int
+
+	public init(objectId: String, bytes: Data, hash: String, heads: [String], covered: Int) {
+		self.objectId = objectId; self.bytes = bytes; self.hash = hash; self.heads = heads; self.covered = covered
+	}
+}
+
 /// Persistence the sync loop needs; mirrors the browser's IndexedDB stores
-/// (`changes`, `meta`) so behavior stays comparable. All methods are idempotent.
+/// (`changes`, `checkpoints`, `meta`) so behavior stays comparable. All methods are idempotent.
 public protocol ChangeStore: Sendable {
 	/// Adds records not already present (by id). Returns how many were new.
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int
 	func changesFor(objectId: String) async throws -> [ChangeRecord]
+	/// Every object held as changes or as a checkpoint.
 	func objectIds() async throws -> [String]
+
+	func checkpoint(objectId: String) async throws -> CheckpointRecord?
+	/// Keeps `record` when it beats the stored one: more covered wins, then the larger hash. Returns whether it was stored.
+	func putCheckpoint(_ record: CheckpointRecord) async throws -> Bool
+	/// Publisher manifest cursors per scope ("" personal, else the space tag): kind-1078 events older than the floor are folded into checkpoints.
+	func checkpointFloors() async throws -> [String: Int64]
+	func setCheckpointFloor(scope: String, _ floor: Int64) async throws
 
 	func cursor() async throws -> Int64
 	/// Persists the cursor together with the engine's replay obligations, atomically.

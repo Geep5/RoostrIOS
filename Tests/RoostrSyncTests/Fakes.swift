@@ -88,6 +88,8 @@ actor InMemoryChangeStore: ChangeStore {
 	private var floor: Int64?
 	private var pendings: [String: PendingPublish] = [:]
 	private var published: Set<String> = []
+	private var checkpoints: [String: CheckpointRecord] = [:]
+	private var floors: [String: Int64] = [:]
 
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int {
 		var added = 0
@@ -100,7 +102,16 @@ actor InMemoryChangeStore: ChangeStore {
 	}
 
 	func changesFor(objectId: String) async throws -> [ChangeRecord] { changes[objectId] ?? [] }
-	func objectIds() async throws -> [String] { Array(changes.keys) }
+	func objectIds() async throws -> [String] { Array(Set(changes.keys).union(checkpoints.keys)) }
+
+	func checkpoint(objectId: String) async throws -> CheckpointRecord? { checkpoints[objectId] }
+	func putCheckpoint(_ record: CheckpointRecord) async throws -> Bool {
+		if let existing = checkpoints[record.objectId], !(record.covered > existing.covered || (record.covered == existing.covered && record.hash > existing.hash)) { return false }
+		checkpoints[record.objectId] = record
+		return true
+	}
+	func checkpointFloors() async throws -> [String: Int64] { floors }
+	func setCheckpointFloor(scope: String, _ floor: Int64) async throws { floors[scope] = floor }
 
 	func cursor() async throws -> Int64 { cursorValue }
 	func setCursor(_ cursor: Int64, replayGroups: [(String, Int64)]) async throws {
