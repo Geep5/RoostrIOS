@@ -1,0 +1,1 @@
+var e={page:`📄`,note:`📝`,task:`✅`,person:`👤`,project:`🔨`,bookmark:`🔖`,query:`🔍`,set:`🔍`,collection:`🗂️`,peer:`◉`,agent:`◈`,channel:`◍`,chat:`💬`};function t(t,n){return t||(e[n]??`•`)}export{t as n,e as t};
