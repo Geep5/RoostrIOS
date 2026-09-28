@@ -3,7 +3,7 @@
   "compiler": "/opt/homebrew/bin/odin version dev-2026-07:819fdc7a8",
   "target": "js_wasm32",
   "artifact": "engine.wasm",
-  "sha256": "251951ed65ee2751fc9af3570461ab3ae6e0deb529bb0f22236fad8789dd5680",
+  "sha256": "ef9c6f405de1072f9a50519162407b69897cf3f9061f6e651014a1bbf6fc7e3e",
   "sourceFingerprint": "32dc144edef87b325cebd88851eec3ff0d1596b4c2dd679310634ec8d0de671c",
   "sourceFiles": {
     "abi/abi.odin": "8c81cc5b058d4b764a649591a4061586fcd9471e7997ec73a6a48d918b81ca28",
