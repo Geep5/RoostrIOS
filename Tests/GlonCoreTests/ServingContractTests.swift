@@ -13,7 +13,7 @@ final class ServingContractTests: XCTestCase {
 	private struct Serving: Decodable, Equatable {
 		let machineId: String
 		let reason: String
-		let requires: [String]
+		let skills: [String]
 		let candidates: [String]
 	}
 
@@ -29,7 +29,7 @@ final class ServingContractTests: XCTestCase {
 
 	func testResolve() async throws {
 		let fixtures = Self.fixtures.resolve
-		XCTAssertEqual(fixtures.count, 24)
+		XCTAssertEqual(fixtures.count, 28)
 		for fixture in fixtures {
 			guard case .object(var fields) = fixture, let name = fields["name"]?.string else { continue }
 			let expected = fields["expected"]
@@ -48,7 +48,7 @@ final class ServingContractTests: XCTestCase {
 			let serving: Serving = try await GlonCore.shared.call("serving", JSONValue.object(fields))
 			XCTAssertEqual(serving.machineId, expected?["machineId"]?.string, name)
 			XCTAssertEqual(serving.reason, expected?["reason"]?.string, name)
-			XCTAssertEqual(serving.requires, Self.strings(expected?["requires"]), name)
+			XCTAssertEqual(serving.skills, Self.strings(expected?["skills"]), name)
 			XCTAssertEqual(serving.candidates, Self.strings(expected?["candidates"]), name)
 		}
 	}
