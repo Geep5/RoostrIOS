@@ -1,0 +1,1 @@
+import{m as e}from"./Do_WbcAn.js";var t={page:`📄`,note:`📝`,task:`✅`,person:`👤`,project:`🔨`,bookmark:`🔖`,query:`🔍`,set:`🔍`,collection:`🗂️`,peer:`◉`,agent:`🤖`,channel:`◍`,chat:`💬`,credential:`🔑`};function n(n){return e.types.find(e=>e.key===n&&e.icon)?.icon||t[n]||``}function r(e,t){return e||n(t)||`•`}export{r as n,n as r,t};
