@@ -1,1 +1,0 @@
-import{n as e}from"../nodes/6.BIg1vxb1.js";export{e as createWebgpuRenderer};
