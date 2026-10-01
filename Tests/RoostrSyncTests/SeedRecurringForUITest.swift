@@ -19,7 +19,7 @@ final class SeedRecurringForUITest: XCTestCase {
 		let minutes = Int64((Calendar.current.component(.hour, from: now) * 60 + Calendar.current.component(.minute, from: now) + 30) % 1440)
 		_ = try await backend.mutate(action: "repeat_set", params: .object([
 			"object_id": .string(id),
-			"rule": .object(["freq": .string("day"), "interval": .int(1), "time": .int(minutes), "tz": .string(TimeZone.current.identifier)]),
+			"rule": .object(["freq": .string("day"), "interval": .int(1), "times": .array([.int(minutes)]), "tz": .string(TimeZone.current.identifier)]),
 			"now_ms": .int(Int64(now.timeIntervalSince1970 * 1000)),
 			"tz_offset_min": .int(Int64(TimeZone.current.secondsFromGMT() / 60)),
 		]))

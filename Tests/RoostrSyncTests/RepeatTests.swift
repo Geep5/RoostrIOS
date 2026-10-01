@@ -16,7 +16,7 @@ final class RepeatTests: XCTestCase {
 		// Sunday 2026-09-13 10:00 in UTC-7; a Sunday/Wednesday rule at 23:30 starts today.
 		let now: Int64 = 1_789_318_800_000
 		let clock: [String: JSONValue] = ["now_ms": .int(now), "tz_offset_min": .int(-420)]
-		let rule: JSONValue = .object(["freq": .string("week"), "interval": .int(1), "weekdays": .array([.int(0), .int(3)]), "time": .int(1410), "tz": .string("America/Los_Angeles")])
+		let rule: JSONValue = .object(["freq": .string("week"), "interval": .int(1), "weekdays": .array([.int(0), .int(3)]), "times": .array([.int(1410)]), "tz": .string("America/Los_Angeles")])
 		let set = try await backend.mutate(action: "repeat_set", params: .object(["object_id": .string(id), "rule": rule].merging(clock) { a, _ in a }))
 		let today2330 = Int64(1_789_367_400_000) // 2026-09-14T06:30:00Z
 		XCTAssertEqual(set["next"]?.int, today2330)
@@ -60,7 +60,7 @@ extension RepeatTests {
 			if agent { fields["assignee"] = .object(["stringValue": .string("agent-1")]) }
 			let created = try await backend.mutate(action: "create", params: .object(["name": .string(name), "type_key": .string(type), "fields": .object(fields)]))
 			let id = try XCTUnwrap(created["id"]?.string)
-			_ = try await backend.mutate(action: "repeat_set", params: .object(["object_id": .string(id), "rule": .object(["freq": .string("day"), "interval": .int(1), "time": .int(time)])].merging(clock) { a, _ in a }))
+			_ = try await backend.mutate(action: "repeat_set", params: .object(["object_id": .string(id), "rule": .object(["freq": .string("day"), "interval": .int(1), "times": .array([.int(time)])])].merging(clock) { a, _ in a }))
 			return id
 		}
 		let evening = try await recurring("Water the plants", type: "task", time: 1200)   // 20:00 today

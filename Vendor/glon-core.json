@@ -7,7 +7,7 @@
     "ios-arm64-simulator",
     "macos-arm64"
   ],
-  "sourceFingerprint": "60faa5b267d0f884a137865dee01decf6ff556b182a2ff2d5c96f7347b9c8580",
+  "sourceFingerprint": "8a533bb63d4cada8d0b8cb284e3f6d67dc3240111809de1ec15b8da2fec039b5",
   "sourceFiles": {
     "abi/abi.odin": "8c81cc5b058d4b764a649591a4061586fcd9471e7997ec73a6a48d918b81ca28",
     "core/agent_message.odin": "4e1f277a7614455fc8836d6f22b18647b5888164d6fa06bcaec76c853963fea4",
@@ -22,11 +22,11 @@
     "core/descriptor_json.odin": "97d58abfcbc595a5564b79f55662c6835e783bd3cd89c2fecc68cd52cfed9f5d",
     "core/dispatch.odin": "45f0973dd1a1c22079e73e52417f658bb36e2c9cac9960c6c95362541e5d95ed",
     "core/jsonx.odin": "c036c957ef7209aabae3b9addc319125095bc1b3d8183e4d34e1777e21f0a5ce",
-    "core/mutate.odin": "6f293424c0e919ee91b471939da0a317208240cd3b616edf407f7fbe6ff92653",
+    "core/mutate.odin": "84dd1d72ac8849f78a974be22f64677f441548db5b8a996fbd87d9bf625b89a1",
     "core/nip44.odin": "71412d79e95596ecf93c1ffb11909824bb6b44c1bd3fea3ca9c351a46fed9e82",
     "core/proto.odin": "2ce60b2ea1b80a88eae07df06388f3964fef43b793877263c0774e347794ff81",
     "core/query.odin": "af742da8b1f059da9bef2c91d292da4c0f4b7c1b8d6fe55f0b9fbcad7107df00",
-    "core/repeat.odin": "06015d05c851740f25905d639202936cc10e10c05bf62002d5b35b2175e1be29",
+    "core/repeat.odin": "1924221fccf3207823ae52bb087ba49036fe7bf28188a5a8cf1d884c2ebaf24e",
     "core/replay.odin": "4b37e9f51e80d9699b93b3ec054828871cfeb612b45aee0aaab1de1ecd425300",
     "core/serving.odin": "7b114dd738028d1b2d43bc1633bc322e1d2086287feb4b7277680f3ed1e0d7a9",
     "core/sync_outbox.odin": "302aca2530f9e001ca847a32aeb2fd94d0ac9f3f0ff9d92caf138b2cf99a4190",
