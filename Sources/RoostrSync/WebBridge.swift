@@ -10,6 +10,10 @@ import WebKit
 //   JS → Swift   window.webkit.messageHandlers.roostr.postMessage({id, method, args})
 //   Swift → JS   window.__roostrReply(id, ok, payload)   payload = result, or {message} when !ok
 //                window.__roostrEvent("status" | "commit", payload)
+//
+// A page (re)load, the page's "syncNow" and a pull on the web view (iOS) all
+// reconnect the relays and catch up (`Backend.resume`): reloading only the
+// page would re-read the local store from behind a possibly dead socket.
 
 /// The relay list the website keeps in `localStorage["roostr-relays"]`. It
 /// lives outside the replica on purpose: the backend is built from it and
@@ -119,6 +123,7 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 	/// A web view serving `bundleURL` (the website's static build) under
 	/// `roostr://app/`, with the platform marker injected at document start
 	/// and this bridge as the `roostr` message handler. Loads `startURL`.
+	/// On iOS, pulling the page down syncs now.
 	public func makeWebView(bundleURL: URL) -> WKWebView {
 		let configuration = WKWebViewConfiguration()
 		configuration.setURLSchemeHandler(RoostrSchemeHandler(root: bundleURL), forURLScheme: Self.scheme)
@@ -129,10 +134,39 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 		#if DEBUG
 		webView.isInspectable = true
 		#endif
+		#if canImport(UIKit)
+		let refresh = UIRefreshControl()
+		refresh.addTarget(self, action: #selector(pulledToRefresh(_:)), for: .valueChanged)
+		// The SPA fills the viewport, so the page itself never scrolls; let it bounce so the pull registers.
+		webView.scrollView.alwaysBounceVertical = true
+		webView.scrollView.refreshControl = refresh
+		#endif
 		self.webView = webView
 		webView.load(URLRequest(url: Self.startURL))
 		return webView
 	}
+
+	/// Reconnects and catches up (`Backend.resume`); returns when that pass is
+	/// done (live again, or the relays did not answer) or after `deadline`,
+	/// whichever comes first. The reconnect itself carries on past the deadline.
+	public func syncNow(deadline: Duration = .seconds(8)) async {
+		guard let backend = host.backend else { return }
+		await withTaskGroup(of: Void.self) { group in
+			group.addTask { await backend.resume() }
+			group.addTask { try? await Task.sleep(for: deadline) }
+			await group.next()
+			group.cancelAll()
+		}
+	}
+
+	#if canImport(UIKit)
+	@objc private func pulledToRefresh(_ control: UIRefreshControl) {
+		Task {
+			await syncNow()
+			control.endRefreshing()
+		}
+	}
+	#endif
 
 	/// Navigates the SPA to an in-app path (e.g. `/app/object/<id>`) without a reload.
 	public func navigate(to path: String) {
@@ -189,7 +223,12 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 		case "start":
 			let backend = try backend()
 			subscribe(backend)
+			// A reload is the page's refresh: reconnect behind it (a no-op while the engine is still starting).
+			Task { await backend.resume() }
 			return await status(backend)
+		case "syncNow":
+			await syncNow()
+			return await status(try backend())
 		case "stop":
 			unsubscribe()
 			return JSONValue.null

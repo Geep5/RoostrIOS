@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Observation
 import GlonCore
 import RoostrSync
@@ -24,6 +25,10 @@ public final class AppModel: WebBridgeHost {
 	private let databasePath: String
 	private var store: SQLiteChangeStore?
 	private let reminders = Reminders()
+	private let pathMonitor = NWPathMonitor()
+	/// Interfaces of the last satisfied network path; nil while offline or before the first update.
+	private var pathInterfaces: [String]?
+	private var pathSeen = false
 
 	public init(identity: IdentityStore, keyring: SpaceKeyring, databasePath: String) {
 		self.identity = identity
@@ -31,6 +36,11 @@ public final class AppModel: WebBridgeHost {
 		self.databasePath = databasePath
 		reminders.onOpen = { [weak self] objectId in self?.pendingRoute = "/app/object/\(objectId)" }
 		reminders.onScheduled = { [weak self] summary in self?.remindersDebug = summary }
+		pathMonitor.pathUpdateHandler = { [weak self] path in
+			let interfaces = path.status == .satisfied ? path.availableInterfaces.map(\.name) : nil
+			Task { @MainActor in self?.networkChanged(interfaces) }
+		}
+		pathMonitor.start(queue: .global(qos: .utility))
 	}
 
 	/// Production configuration: Keychain identity, relays from
@@ -63,6 +73,21 @@ public final class AppModel: WebBridgeHost {
 		} catch {
 			lastError = "\(error)"
 		}
+	}
+
+	/// Reconnects every relay now and catches up (`Backend.resume`): the app
+	/// returned from the background, where iOS may have killed its sockets
+	/// without telling them.
+	public func resume() async {
+		await backend?.resume()
+	}
+
+	/// Back online or onto another interface (Wi-Fi ⇄ cellular): sockets bound
+	/// to the old path are dead, so reconnect instead of waiting for keepalive.
+	private func networkChanged(_ interfaces: [String]?) {
+		defer { pathInterfaces = interfaces; pathSeen = true }
+		guard pathSeen, let interfaces, interfaces != pathInterfaces else { return }
+		Task { await resume() }
 	}
 
 	public func generateKey() async throws {

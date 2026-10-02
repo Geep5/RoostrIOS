@@ -64,6 +64,15 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 		for listener in listeners { listener.yield(event) }
 	}
 
+	/// Every live subscription fails as a dropped socket would; stored events stay.
+	func disconnect() async {
+		let dropped = lock.withLock {
+			defer { subscriptions.removeAll() }
+			return subscriptions.values.map(\.continuation)
+		}
+		for continuation in dropped { continuation.finish(throwing: URLError(.networkConnectionLost)) }
+	}
+
 	private static func matches(_ filter: NostrFilter, _ event: NostrEvent) -> Bool {
 		if let ids = filter.ids, !ids.contains(event.id) { return false }
 		if let authors = filter.authors, !authors.contains(event.pubkey) { return false }
@@ -75,6 +84,72 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 			if !present { return false }
 		}
 		return true
+	}
+}
+
+/// A link to `relay` that can go half-open, like a socket that outlived an app
+/// suspension: while stalled, live subscriptions stay open but receive nothing
+/// (events published meanwhile are lost to them) and queries and publishes
+/// time out. `disconnect()` fails the open subscriptions; later calls dial a
+/// working link again. Unlike `FakeRelay`, a subscription first replays the
+/// stored matches, oldest first, as a relay answers a REQ before EOSE.
+final class StallingRelay: RelayClient, @unchecked Sendable {
+	let relay: FakeRelay
+	var url: URL { relay.url }
+	private let lock = NSLock()
+	private var stalled = false
+	private var lives: [UUID: AsyncThrowingStream<NostrEvent, Error>.Continuation] = [:]
+
+	init(_ relay: FakeRelay) {
+		self.relay = relay
+	}
+
+	func stall() {
+		lock.withLock { stalled = true }
+	}
+
+	private var isStalled: Bool { lock.withLock { stalled } }
+
+	func query(_ filters: [NostrFilter], timeout: Duration) async throws -> [NostrEvent] {
+		if isStalled { throw RelayError.timeout }
+		return try await relay.query(filters, timeout: timeout)
+	}
+
+	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error> {
+		let id = UUID()
+		let (stream, continuation) = AsyncThrowingStream<NostrEvent, Error>.makeStream()
+		let upstream = relay.subscribe(filters)
+		let forward = Task { [weak self, relay] in
+			do {
+				if self?.isStalled == false {
+					for event in try await relay.query(filters, timeout: .seconds(1)).reversed() { continuation.yield(event) }
+				}
+				for try await event in upstream where self?.isStalled == false { continuation.yield(event) }
+			} catch {
+				continuation.finish(throwing: error)
+			}
+		}
+		lock.withLock { lives[id] = continuation }
+		continuation.onTermination = { [weak self] _ in
+			forward.cancel()
+			guard let self else { return }
+			self.lock.withLock { _ = self.lives.removeValue(forKey: id) }
+		}
+		return stream
+	}
+
+	func publish(_ event: NostrEvent, timeout: Duration) async throws {
+		if isStalled { throw RelayError.timeout }
+		try await relay.publish(event, timeout: timeout)
+	}
+
+	func disconnect() async {
+		let dropped = lock.withLock {
+			stalled = false
+			defer { lives.removeAll() }
+			return Array(lives.values)
+		}
+		for continuation in dropped { continuation.finish(throwing: URLError(.networkConnectionLost)) }
 	}
 }
 

@@ -7,19 +7,23 @@ public enum RelayError: Error, Equatable {
 	case closed(String)
 	/// `OK false` for a published event.
 	case rejected(String)
+	/// No pong within the keepalive deadline: the socket is presumed half-open.
+	case unresponsive
 }
 
 /// NIP-01 client over `URLSessionWebSocketTask`. Connects on first use; a
 /// failed socket is dropped so the next call dials again. Transport errors
 /// propagate as thrown by URLSession so callers can tell them from relay
-/// answers.
+/// answers. An open socket is pinged every `keepalive`; a missing pong after
+/// `pongTimeout` fails it, since a socket that outlived a suspension or a
+/// network change can otherwise wait on `receive()` forever.
 public final class WebSocketRelay: RelayClient, @unchecked Sendable {
 	public let url: URL
 	private let core: Core
 
-	public init(url: URL, session: URLSession = .shared) {
+	public init(url: URL, session: URLSession = .shared, keepalive: Duration = .seconds(25), pongTimeout: Duration = .seconds(10)) {
 		self.url = url
-		self.core = Core(url: url, session: session)
+		self.core = Core(url: url, session: session, keepalive: keepalive, pongTimeout: pongTimeout)
 	}
 
 	public func query(_ filters: [NostrFilter], timeout: Duration) async throws -> [NostrEvent] {
@@ -39,8 +43,7 @@ public final class WebSocketRelay: RelayClient, @unchecked Sendable {
 		try await core.publish(event, timeout: timeout)
 	}
 
-	/// Simulates a transport failure: everything in flight fails, the next call redials.
-	func disconnect() async {
+	public func disconnect() async {
 		await core.disconnect()
 	}
 }
@@ -61,6 +64,8 @@ private struct Query {
 private actor Core {
 	let url: URL
 	private let session: URLSession
+	private let keepalive: Duration
+	private let pongTimeout: Duration
 	private let encoder: JSONEncoder = {
 		let encoder = JSONEncoder()
 		encoder.outputFormatting = .withoutEscapingSlashes
@@ -69,15 +74,20 @@ private actor Core {
 	private let decoder = JSONDecoder()
 
 	private var socket: URLSessionWebSocketTask?
+	private var pinger: Task<Void, Never>?
+	/// The ping still waiting for its pong; cleared when it arrives.
+	private var awaitingPong: UUID?
 	private var queries: [String: Query] = [:]
 	private var lives: [String: AsyncThrowingStream<NostrEvent, Error>.Continuation] = [:]
 	private var publishes: [String: Waiter<Void>] = [:]
 	/// Streams the consumer dropped before their REQ went out.
 	private var abandoned: Set<String> = []
 
-	init(url: URL, session: URLSession) {
+	init(url: URL, session: URLSession, keepalive: Duration, pongTimeout: Duration) {
 		self.url = url
 		self.session = session
+		self.keepalive = keepalive
+		self.pongTimeout = pongTimeout
 	}
 
 	static func subscriptionId() -> String {
@@ -173,6 +183,7 @@ private actor Core {
 		socket = task
 		task.resume()
 		Task { await self.receive(on: task) }
+		pinger = Task { await self.ping(on: task) }
 		return task
 	}
 
@@ -203,6 +214,30 @@ private actor Core {
 		}
 	}
 
+	/// While `task` is current: a ping every `keepalive`, and a socket whose pong
+	/// misses `pongTimeout` (or whose ping errors) is failed so callers redial.
+	private func ping(on task: URLSessionWebSocketTask) async {
+		while socket === task {
+			do { try await Task.sleep(for: keepalive) } catch { return }
+			guard socket === task else { return }
+			let probe = UUID()
+			awaitingPong = probe
+			task.sendPing { [weak self] error in
+				Task { await self?.ponged(probe, on: task, error) }
+			}
+			do { try await Task.sleep(for: pongTimeout) } catch { return }
+			if awaitingPong == probe {
+				fail(RelayError.unresponsive, on: task)
+				return
+			}
+		}
+	}
+
+	private func ponged(_ probe: UUID, on task: URLSessionWebSocketTask, _ error: Error?) {
+		if let error { fail(error, on: task); return }
+		if awaitingPong == probe { awaitingPong = nil }
+	}
+
 	private func handle(_ frame: ServerFrame) {
 		switch frame {
 		case .event(let id, let event):
@@ -229,6 +264,9 @@ private actor Core {
 	private func fail(_ error: Error, on task: URLSessionWebSocketTask) {
 		guard socket === task else { return }
 		socket = nil
+		pinger?.cancel()
+		pinger = nil
+		awaitingPong = nil
 		task.cancel(with: .abnormalClosure, reason: nil)
 		let queries = self.queries, lives = self.lives, publishes = self.publishes
 		self.queries = [:]; self.lives = [:]; self.publishes = [:]

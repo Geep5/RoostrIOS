@@ -105,6 +105,7 @@ public actor SyncEngine {
 	private var walkTask: Task<Void, Never>?
 	private var liveTask: Task<Void, Never>?
 	private var outboxTask: Task<Void, Never>?
+	private var resumeTask: Task<Void, Never>?
 	private var importChain: Task<Error?, Never>?
 	/// Walks run strictly in order, as the browser's backfillChain.
 	private var backfillChain: Task<Result<Bool, Error>, Never>?
@@ -183,6 +184,35 @@ public actor SyncEngine {
 		statusSinks.removeAll()
 		commitSinks.removeAll()
 		wrapSinks.removeAll()
+	}
+
+	/// Brings sync back now instead of trusting sockets that may be dead: the
+	/// app returned to the foreground, the network path changed, or the user
+	/// asked to refresh. Drops every relay socket (one that outlived a
+	/// suspension can be half-open and never fail), resubscribes live from the
+	/// cursor without the reconnect backoff, re-fetches gift wraps and wakes
+	/// the outbox so pending publishes go out at once. Concurrent calls share
+	/// one pass; a no-op until `start()` has brought the live subscriptions up.
+	public func resume() async {
+		if let resumeTask { return await resumeTask.value }
+		guard !stopped, liveUp else { return }
+		let task = Task { await self.reconnect() }
+		resumeTask = task
+		await task.value
+		resumeTask = nil
+	}
+
+	private func reconnect() async {
+		emit(SyncStatus(phase: .backfill, imported: importedCount, pending: pendingCount, detail: "Reconnecting…"))
+		liveTask?.cancel()
+		for relay in relays { await relay.disconnect() }
+		if stopped { return }
+		subscribeLive()
+		let reachable = await fetchWraps(from: relays)
+		if stopped { return }
+		await wakeOutbox()
+		// No answer: the live loops report their failures and keep redialing.
+		if reachable { emitLiveStatus() }
 	}
 
 	/// Test helper: resolves when no walk, import, live event, publish or
@@ -667,12 +697,18 @@ public actor SyncEngine {
 	/// One relay's live subscription; a dropped stream resubscribes from the
 	/// current cursor after 2 s, doubling up to 60 s. Wraps are re-queried on
 	/// every reconnect: their created_at is randomized, so no cursor covers them.
+	/// A reconnect the relay answers resets the backoff, reports live again and
+	/// wakes the outbox, whose items backed off while the socket was down.
 	private func liveLoop(_ relay: RelayClient, since initial: Int64, spaceTags: [String]) async {
 		var since = initial
 		var backoff = Self.liveBackoffFloor
 		var reconnecting = false
 		while !stopped && !Task.isCancelled {
-			if reconnecting { await fetchWraps(from: [relay]) }
+			if reconnecting, await fetchWraps(from: [relay]), !stopped, !Task.isCancelled {
+				backoff = Self.liveBackoffFloor
+				await wakeOutbox()
+				emitLiveStatus()
+			}
 			let stream = relay.subscribe(liveFilters(since: since, spaceTags: spaceTags))
 			do {
 				for try await event in stream {
@@ -681,7 +717,7 @@ public actor SyncEngine {
 				}
 			} catch {
 				if stopped || Task.isCancelled { return }
-				emit(SyncStatus(phase: .backfill, imported: importedCount, pending: pendingCount, detail: "\(relay.url): \(String(describing: error).prefix(100))"))
+				emit(SyncStatus(phase: .backfill, imported: importedCount, pending: pendingCount, detail: "Reconnecting… \(relay.url): \(String(describing: error).prefix(100))"))
 			}
 			if stopped || Task.isCancelled { return }
 			try? await Task.sleep(for: backoff)
@@ -694,18 +730,24 @@ public actor SyncEngine {
 	// ── Gift wraps ──
 
 	/// Every stored wrap addressed to us, oldest first, from each of `relays`.
-	private func fetchWraps(from relays: [RelayClient]) async {
+	/// True when at least one relay answered.
+	@discardableResult
+	private func fetchWraps(from relays: [RelayClient]) async -> Bool {
 		let filter = NostrFilter(kinds: [giftWrapKind], tagged: ["p": [pk]])
 		var byId: [String: NostrEvent] = [:]
-		await withTaskGroup(of: [NostrEvent].self) { group in
+		var answered = false
+		await withTaskGroup(of: [NostrEvent]?.self) { group in
 			for relay in relays {
-				group.addTask { (try? await relay.query([filter], timeout: Self.queryTimeout)) ?? [] }
+				group.addTask { try? await relay.query([filter], timeout: Self.queryTimeout) }
 			}
 			for await events in group {
+				guard let events else { continue }
+				answered = true
 				for event in events { byId[event.id] = event }
 			}
 		}
 		for event in byId.values.sorted(by: { $0.created_at != $1.created_at ? $0.created_at < $1.created_at : $0.id < $1.id }) { deliverWrap(event) }
+		return answered
 	}
 
 	private func deliverWrap(_ event: NostrEvent) {
@@ -815,9 +857,24 @@ public actor SyncEngine {
 		guard r.queued else { return }
 		queueDirty = true
 		emitLiveStatus()
+		drainOutbox()
+	}
+
+	private func drainOutbox() {
 		if !queueRunning {
 			queueRunning = true
 			outboxTask = Task { await self.runPublishQueue() }
+		}
+	}
+
+	/// The transport is back: queued publishes skip the backoff their failures earned.
+	private func wakeOutbox() async {
+		guard sessionOpen, !stopped else { return }
+		guard let r: OutboxResultOutcome = try? await Engine.sync("outbox_wake") else { return }
+		pendingCount = r.pending
+		if r.pending > 0 {
+			queueDirty = true
+			drainOutbox()
 		}
 	}
 

@@ -117,4 +117,95 @@ final class SyncEngineTests: XCTestCase {
 		XCTAssertEqual(walk.since, cursor + 1)
 		await second.stop()
 	}
+
+	/// The phone holds the vault's history; a laptop change lands a second later
+	/// while the phone's link is half-open and its own new note fails to publish.
+	private struct HalfOpenScenario {
+		let link: StallingRelay
+		let store: InMemoryChangeStore
+		let phone: Backend
+		let laptopId: String
+		/// Newest history event the phone imported, and the oldest laptop event it missed.
+		let historyNewest: Int64
+		let laptopOldest: Int64
+		let statuses: StatusLog
+	}
+
+	private func halfOpenScenario() async throws -> HalfOpenScenario {
+		let history = FakeRelay()
+		_ = try await seed(history)
+		// Strictly newer than the phone's cursor (created_at has 1 s resolution).
+		try await Task.sleep(for: .milliseconds(1_100))
+		let laptop = FakeRelay()
+		let laptopId = try await seed(laptop)
+
+		let relay = FakeRelay()
+		for event in history.stored { try await relay.publish(event, timeout: .seconds(1)) }
+		let link = StallingRelay(relay)
+		let store = InMemoryChangeStore()
+		let phone = Backend(key: key, relays: [link], store: store)
+		await phone.start()
+		await phone.awaitIdle()
+		let statuses = StatusLog(await phone.statusUpdates())
+
+		link.stall()
+		_ = try await phone.createNote(name: "From phone", text: "sent while half-open")
+		// The first attempt fails on the dead link and backs the item off (4 s).
+		_ = try await eventually { try await store.pendingPublishes().first { $0.events != nil } }
+		for event in laptop.stored { try await relay.publish(event, timeout: .seconds(1)) }
+		try await Task.sleep(for: .milliseconds(100))
+		let early = try await phone.objects().contains { $0.id == laptopId }
+		XCTAssertFalse(early, "a half-open link delivers nothing")
+		return HalfOpenScenario(link: link, store: store, phone: phone, laptopId: laptopId, historyNewest: history.stored.map(\.created_at).max()!, laptopOldest: laptop.stored.map(\.created_at).min()!, statuses: statuses)
+	}
+
+	/// Caught up from the cursor, own pending changes flushed well inside their backoff, indicator back to live.
+	private func assertRecovered(_ s: HalfOpenScenario, within: Duration) async throws {
+		_ = try await eventually(timeout: within) {
+			let caughtUp = try await s.phone.objects().contains { $0.id == s.laptopId }
+			let flushed = try await s.store.pendingPublishes().isEmpty
+			return caughtUp && flushed ? true : nil
+		}
+		let live = try XCTUnwrap(s.link.relay.subscribeFilters.last { $0.authors != nil })
+		let since = try XCTUnwrap(live.since)
+		XCTAssertTrue(since > s.historyNewest && since <= s.laptopOldest, "the new subscription resumes from the cursor: since \(since), history \(s.historyNewest), laptop \(s.laptopOldest)")
+		_ = try await eventually { s.statuses.last?.phase == .live ? true : nil }
+		let seen = s.statuses.all
+		let reconnecting = try XCTUnwrap(seen.firstIndex { $0.phase == .backfill && $0.detail?.hasPrefix("Reconnecting…") == true }, "\(seen)")
+		XCTAssertTrue(seen[reconnecting...].contains { $0.phase == .live }, "the indicator returns to live: \(seen)")
+	}
+
+	func testResumeReconnectsHalfOpenLinkAtOnce() async throws {
+		let s = try await halfOpenScenario()
+		await s.phone.resume()
+		// Inside the 4 s publish backoff and without the 2 s reconnect backoff.
+		try await assertRecovered(s, within: .seconds(1.5))
+		await s.phone.stop()
+	}
+
+	func testDroppedSocketReconnectsAndFlushesWithoutResume() async throws {
+		let s = try await halfOpenScenario()
+		// What the relay's keepalive does to a socket whose pong never comes.
+		await s.link.disconnect()
+		try await assertRecovered(s, within: .seconds(3.5))
+		await s.phone.stop()
+	}
+}
+
+/// Every status a stream yields, readable from the test.
+private final class StatusLog: @unchecked Sendable {
+	private let lock = NSLock()
+	private var seen: [SyncStatus] = []
+	private var task: Task<Void, Never>?
+
+	init(_ stream: AsyncStream<SyncStatus>) {
+		task = Task { [weak self] in
+			for await status in stream { self?.lock.withLock { self?.seen.append(status) } }
+		}
+	}
+
+	deinit { task?.cancel() }
+
+	var all: [SyncStatus] { lock.withLock { seen } }
+	var last: SyncStatus? { lock.withLock { seen.last } }
 }

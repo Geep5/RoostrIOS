@@ -125,6 +125,7 @@ final class SyncSessionTests: XCTestCase {
 		try await faultsOnConflictAndExpiry()
 		try await restoresReplayGroupsAndRejectsWithoutSession()
 		try await outboxOrderBackoffAndSealing()
+		try await outboxWakeClearsBackoff()
 	}
 
 	private func singlePartAndPubkeyRule() async throws {
@@ -314,6 +315,31 @@ final class SyncSessionTests: XCTestCase {
 		} catch {
 			XCTAssertEqual(error as? GlonError, .engine("unknown outbox key"))
 		}
+		try await close()
+	}
+
+	private func outboxWakeClearsBackoff() async throws {
+		_ = try await sync("session", ["pk": .string(Self.pk), "conversationKey": .string(Self.conversationKey), "secret": .string(Self.secret), "cursor": .int(0)])
+		let change = try await wireChange("note-1", size: 0)
+		_ = try await enqueue("c1", objectId: "note-1", changeId: "c1", bytes: change)
+		_ = try await outboxNext(at: 1_000)
+		_ = try await outboxResult("c1", ok: false, sealed: true, at: 1_000)
+		_ = try await outboxNext(at: 1_001)
+		_ = try await outboxResult("c1", ok: false, sealed: true, at: 1_001)
+		var r = try await outboxNext(at: 1_002)
+		XCTAssertNil(r["item"])
+		XCTAssertEqual(r["waitMs"]?.int, 7_999, "two failures back off 8 s")
+
+		r = try await sync("outbox_wake")
+		XCTAssertEqual(r["pending"]?.int, 1)
+		r = try await outboxNext(at: 1_003)
+		let item = try XCTUnwrap(r["item"], "a woken item is ready at once")
+		XCTAssertEqual(item["attempts"]?.int, 2, "wake keeps the attempt count")
+		// Waking leaves an in-flight item alone; its failure backs off from attempt 2.
+		_ = try await sync("outbox_wake")
+		_ = try await outboxResult("c1", ok: false, sealed: true, at: 1_004)
+		r = try await outboxNext(at: 1_005)
+		XCTAssertEqual(r["waitMs"]?.int, 15_999, "third failure backs off 16 s")
 		try await close()
 	}
 }

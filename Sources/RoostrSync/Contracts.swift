@@ -69,6 +69,10 @@ public protocol RelayClient: Sendable {
 	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error>
 	/// Resolves when the relay answers `OK true`; throws with the relay's message on `OK false` or timeout.
 	func publish(_ event: NostrEvent, timeout: Duration) async throws
+	/// Drops the connection: everything in flight fails and the next call dials
+	/// again. A socket that outlived an app suspension or a network change can
+	/// be half-open and never fail by itself.
+	func disconnect() async
 }
 
 /// One stored change: exact wire bytes plus the engine's decoded JSON (`codec decode` shape).

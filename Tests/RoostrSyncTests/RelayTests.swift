@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import XCTest
 @testable import RoostrSync
 
@@ -114,5 +115,101 @@ final class RelayTests: XCTestCase {
 		let event = try await publish("after failure")
 		let found = try await relay.query([NostrFilter(ids: [event.id])], timeout: Self.timeout)
 		XCTAssertEqual(found, [event])
+	}
+}
+
+/// Keepalive against a local WebSocket endpoint that accepts the socket, reads
+/// every frame and never answers NIP-01: with pongs off it is the half-open
+/// peer a suspended or re-routed socket is left talking to.
+final class RelayKeepaliveTests: XCTestCase {
+	private func liveOutcome(_ relay: WebSocketRelay) -> StreamOutcome {
+		StreamOutcome(relay.subscribe([NostrFilter(kinds: [1])]))
+	}
+
+	func testMissingPongFailsTheSocket() async throws {
+		let server = try MuteWebSocketServer(answersPings: false)
+		defer { server.stop() }
+		let relay = WebSocketRelay(url: try await server.start(), keepalive: .milliseconds(200), pongTimeout: .milliseconds(300))
+		let outcome = liveOutcome(relay)
+		let deadline = ContinuousClock.now + .seconds(3)
+		while !outcome.finished && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+		XCTAssertTrue(outcome.finished, "a socket without pongs must fail its live streams")
+		XCTAssertEqual(outcome.error as? RelayError, .unresponsive)
+	}
+
+	func testAnsweredPingsKeepTheSocket() async throws {
+		let server = try MuteWebSocketServer(answersPings: true)
+		defer { server.stop() }
+		let relay = WebSocketRelay(url: try await server.start(), keepalive: .milliseconds(200), pongTimeout: .milliseconds(300))
+		let outcome = liveOutcome(relay)
+		// Three full ping rounds.
+		try await Task.sleep(for: .milliseconds(1_600))
+		XCTAssertFalse(outcome.finished, "pongs keep a quiet socket open: \(String(describing: outcome.error))")
+		outcome.cancel()
+	}
+}
+
+/// How a live stream ended, if it has.
+private final class StreamOutcome: @unchecked Sendable {
+	private let lock = NSLock()
+	private var ended = false
+	private var failure: Error?
+	private var task: Task<Void, Never>?
+
+	init(_ stream: AsyncThrowingStream<NostrEvent, Error>) {
+		task = Task { [weak self] in
+			var error: Error?
+			do { for try await _ in stream {} } catch let thrown { error = thrown }
+			guard let self else { return }
+			self.lock.withLock { self.ended = true; self.failure = error }
+		}
+	}
+
+	var finished: Bool { lock.withLock { ended } }
+	var error: Error? { lock.withLock { failure } }
+	func cancel() { task?.cancel() }
+}
+
+private final class MuteWebSocketServer: @unchecked Sendable {
+	private let listener: NWListener
+	private let queue = DispatchQueue(label: "mute-websocket")
+	private var connections: [NWConnection] = []
+
+	init(answersPings: Bool) throws {
+		let websocket = NWProtocolWebSocket.Options()
+		websocket.autoReplyPing = answersPings
+		let parameters = NWParameters.tcp
+		parameters.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
+		listener = try NWListener(using: parameters, on: .any)
+		listener.newConnectionHandler = { [weak self] connection in
+			guard let self else { return }
+			self.connections.append(connection)
+			connection.start(queue: self.queue)
+			self.drain(connection)
+		}
+	}
+
+	func start() async throws -> URL {
+		let port: UInt16 = await withCheckedContinuation { continuation in
+			var resumed = false
+			listener.stateUpdateHandler = { [listener] state in
+				guard case .ready = state, !resumed, let port = listener.port else { return }
+				resumed = true
+				continuation.resume(returning: port.rawValue)
+			}
+			listener.start(queue: queue)
+		}
+		return URL(string: "ws://127.0.0.1:\(port)")!
+	}
+
+	private func drain(_ connection: NWConnection) {
+		connection.receiveMessage { [weak self] _, _, _, error in
+			if error == nil { self?.drain(connection) }
+		}
+	}
+
+	func stop() {
+		listener.cancel()
+		queue.sync { for connection in connections { connection.cancel() } }
 	}
 }
