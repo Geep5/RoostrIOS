@@ -61,6 +61,8 @@ public struct IngestResult: Decodable, Sendable {
 	public let decryptFailure: Bool?
 	public let decodeFailure: Bool?
 	public let hTag: String?
+	/// A verified kind-5 from the administrator of an installed space: that space is gone for every member.
+	public let spaceVanished: String?
 }
 
 public struct SettleResult: Decodable, Sendable {
@@ -75,6 +77,8 @@ public struct AuthorizeResult: Decodable, Sendable {
 public struct VanishedEntry: Decodable, Sendable, Equatable {
 	public let objectId: String
 	public let at: Int64
+	/// The identity left the space (relay copies stay for everyone else).
+	public let left: Bool?
 }
 
 public struct SealedPart: Decodable, Sendable, Equatable {
@@ -134,6 +138,8 @@ public enum Engine {
 	/// Replaceable manifest the publisher stamps once every object is covered.
 	public static let manifestKind = 30079
 	public static let manifestTag = "roostr-checkpoint"
+	/// NIP-09 deletion; with `["h", spaceTag]` the space's stream (relay rule, space-vanish contract §4).
+	public static let deletionKind = 5
 
 	static func call<R: Decodable>(_ method: String, _ payload: [String: JSONValue]) async throws -> R {
 		try await GlonCore.shared.call(method, JSONValue.object(payload))
@@ -202,9 +208,10 @@ public enum Engine {
 		return try await call("sync", payload)
 	}
 
-	/// Object ids the synced vanish ledger names.
-	public static func vanished(ledger: JSONValue?) async throws -> [VanishedEntry] {
-		try await sync("vanished", ["ledger": ledger ?? .null])
+	/// Every ledger entry plus each given `{id, channel}` stub whose channel
+	/// names a vanished or left space: the complete set of ids to drop.
+	public static func vanished(ledger: JSONValue?, objects: [JSONValue]) async throws -> [VanishedEntry] {
+		try await sync("vanished", ["ledger": ledger ?? .null, "objects": .array(objects)])
 	}
 }
 

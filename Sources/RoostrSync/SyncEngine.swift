@@ -117,6 +117,7 @@ public actor SyncEngine {
 	private var statusSinks: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
 	private var commitSinks: [UUID: AsyncStream<[String]>.Continuation] = [:]
 	private var wrapSinks: [UUID: AsyncStream<NostrEvent>.Continuation] = [:]
+	private var spaceVanishSinks: [UUID: AsyncStream<String>.Continuation] = [:]
 
 	public init(key: NostrKey, relays: [RelayClient], store: ChangeStore) {
 		self.key = key
@@ -181,9 +182,11 @@ public actor SyncEngine {
 		for sink in statusSinks.values { sink.finish() }
 		for sink in commitSinks.values { sink.finish() }
 		for sink in wrapSinks.values { sink.finish() }
+		for sink in spaceVanishSinks.values { sink.finish() }
 		statusSinks.removeAll()
 		commitSinks.removeAll()
 		wrapSinks.removeAll()
+		spaceVanishSinks.removeAll()
 	}
 
 	/// Brings sync back now instead of trusting sockets that may be dead: the
@@ -229,7 +232,7 @@ public actor SyncEngine {
 			"pk": .string(pk),
 			"conversationKey": .string(try await Engine.conversationKey(sharedX: try key.sharedX(with: pk))),
 			"secret": .string(key.secretHex),
-			"spaces": .array(spaces.values.map(Self.spaceJSON)),
+			"spaces": .array(spaces.values.map(spaceJSON)),
 			"cursor": .int(cursor),
 			"replayGroups": .array(groups.map { .array([.string($0.0), .int($0.1)]) }),
 		])
@@ -243,8 +246,9 @@ public actor SyncEngine {
 		SessionOwner.release(ObjectIdentifier(self))
 	}
 
-	private static func spaceJSON(_ space: SharedSpace) -> JSONValue {
-		.object(["spaceId": .string(space.info.spaceId), "keyHex": .string(space.info.keyHex), "keyId": .int(space.info.keyId)])
+	/// A session space; `owner` is the administrator whose kind 5 vanishes it.
+	private func spaceJSON(_ space: SharedSpace) -> JSONValue {
+		.object(["spaceId": .string(space.info.spaceId), "keyHex": .string(space.info.keyHex), "keyId": .int(space.info.keyId), "owner": .string(space.info.owner ?? pk)])
 	}
 
 	/// Replace the shared-space view the session decrypts under. A space whose
@@ -258,7 +262,7 @@ public actor SyncEngine {
 		}
 		spaces = next
 		if sessionOpen {
-			let _: SessionState? = try? await Engine.sync("spaces", ["spaces": .array(next.values.map(Self.spaceJSON))])
+			let _: SessionState? = try? await Engine.sync("spaces", ["spaces": .array(next.values.map(spaceJSON))])
 		}
 		let tags = Set(next.values.map(\.spaceTag))
 		if stopped || !liveUp { return } // start() wires subscriptions itself
@@ -372,7 +376,8 @@ public actor SyncEngine {
 		]
 		for space in spaces.values {
 			filters.append(NostrFilter(kinds: [Engine.changeKind], since: full ? max(since, await checkpointFloor(scope: space.spaceTag, space: space)) : since, tagged: ["h": [space.spaceTag]]))
-			filters.append(NostrFilter(kinds: [Engine.checkpointKind], since: since, tagged: ["h": [space.spaceTag]]))
+			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
+			filters.append(NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: ["h": [space.spaceTag]]))
 		}
 		var byId: [String: NostrEvent] = [:]
 		var complete = !relays.isEmpty
@@ -508,14 +513,18 @@ public actor SyncEngine {
 	}
 
 	/// Feed one signature-verified relay event to the session; returns the
-	/// decoded payload when a full change or checkpoint (possibly reassembled) is available.
+	/// decoded payload when a full change or checkpoint (possibly reassembled)
+	/// is available. A space administrator's kind 5 goes to the vanish sinks.
 	private func ingest(_ event: NostrEvent) async throws -> ImportItem? {
-		guard event.kind == Engine.changeKind || event.kind == Engine.checkpointKind, NostrKey.verify(event) else { return nil }
+		guard event.kind == Engine.changeKind || event.kind == Engine.checkpointKind || event.kind == Engine.deletionKind, NostrKey.verify(event) else { return nil }
 		guard sessionOpen else { return nil } // stopped or retired
 		let r: IngestResult = try await Engine.sync("ingest", ["event": Self.eventJSON(event), "nowMs": .int(Self.nowMs())])
 		cursor = r.cursor
 		if let at = r.faultAt { await recordReplayFault(at) }
 		if let groups = r.replayGroups { mirror(groups) }
+		if let spaceId = r.spaceVanished {
+			for sink in spaceVanishSinks.values { sink.yield(spaceId) }
+		}
 		guard let item = r.item else { return nil }
 		guard let bytes = Data(base64Encoded: item.bytes) else { throw SyncError.malformedChange }
 		let objectId: String
@@ -685,11 +694,12 @@ public actor SyncEngine {
 		return max(cursor + 1, floor ?? 0)
 	}
 
-	/// Personal changes and checkpoints, every installed space's stream, and gift wraps for us.
+	/// Personal changes and checkpoints, every installed space's stream (with
+	/// its administrator's stream deletion), and gift wraps for us.
 	private func liveFilters(since: Int64, spaceTags: [String]) -> [NostrFilter] {
 		let kinds = [Engine.changeKind, Engine.checkpointKind]
 		var filters = [NostrFilter(authors: [pk], kinds: kinds, since: since)]
-		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: kinds, since: since, tagged: ["h": spaceTags])) }
+		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: kinds + [Engine.deletionKind], since: since, tagged: ["h": spaceTags])) }
 		filters.append(NostrFilter(kinds: [giftWrapKind], since: Int64(Date().timeIntervalSince1970) - wrapLookbackSeconds, tagged: ["p": [pk]]))
 		return filters
 	}
@@ -766,6 +776,18 @@ public actor SyncEngine {
 	}
 
 	private func dropWrapSink(_ id: UUID) { wrapSinks[id] = nil }
+
+	/// Space ids whose administrator deleted them for every member (a verified
+	/// kind 5 on the space's stream), from backfills and the live subscription.
+	public func spaceVanishUpdates() -> AsyncStream<String> {
+		let id = UUID()
+		let (stream, continuation) = AsyncStream<String>.makeStream()
+		spaceVanishSinks[id] = continuation
+		continuation.onTermination = { _ in Task { await self.dropSpaceVanishSink(id) } }
+		return stream
+	}
+
+	private func dropSpaceVanishSink(_ id: UUID) { spaceVanishSinks[id] = nil }
 
 	/// Every event any relay returns for `filters` within `timeout`, deduplicated.
 	public func query(_ filters: [NostrFilter], timeout: Duration) async -> [NostrEvent] {

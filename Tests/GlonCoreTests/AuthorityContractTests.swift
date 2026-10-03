@@ -15,17 +15,21 @@ final class AuthorityContractTests: XCTestCase {
 	private struct Vanished: Decodable {
 		let name: String
 		let ledger: JSONValue
+		/// `{id, channel}` stubs the space rule matches against the ledger.
+		let objects: JSONValue?
 		let expected: [Vanish]
 	}
 
 	private struct Vanish: Decodable, Hashable {
 		let objectId: String
 		let at: Int64
+		let left: Bool?
 	}
 
 	private struct Ledger: Encodable {
 		let action = "vanished"
 		let ledger: JSONValue
+		let objects: JSONValue?
 	}
 
 	private struct Verdict: Decodable {
@@ -88,9 +92,9 @@ final class AuthorityContractTests: XCTestCase {
 
 	func testVanished() async throws {
 		let fixtures = Self.fixtures.vanished
-		XCTAssertEqual(fixtures.count, 3)
+		XCTAssertEqual(fixtures.count, 6)
 		for fixture in fixtures {
-			let vanished: [Vanish] = try await GlonCore.shared.call("sync", Ledger(ledger: fixture.ledger))
+			let vanished: [Vanish] = try await GlonCore.shared.call("sync", Ledger(ledger: fixture.ledger, objects: fixture.objects))
 			XCTAssertEqual(vanished.count, fixture.expected.count, "\(fixture.name): count")
 			XCTAssertEqual(Set(vanished), Set(fixture.expected), fixture.name)
 		}

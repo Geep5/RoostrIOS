@@ -14,6 +14,9 @@ public enum BackendError: Error, Equatable {
 	case invalidPubkey(String)
 	/// No relay accepted the event.
 	case rejected(String)
+	/// The action belongs to the space's other side: only the administrator
+	/// deletes a space for everyone, only a member leaves one.
+	case refused(String)
 }
 
 /// The synced vanish ledger object; the engine reads its entries.
@@ -45,12 +48,17 @@ public actor Backend {
 	public let author: String
 
 	var states: [String: Cached] = [:]
-	/// Object ids the synced ledger says are gone; rebuilt when it commits.
+	/// Object ids the synced ledger says are gone, rule-derived ones (objects
+	/// in a vanished or left space) included; rebuilt when it commits.
 	var vanished: Set<String> = []
+	/// The ids among `vanished` this identity merely left (left spaces and
+	/// their objects): hidden here, untouched on the relays.
+	var leftIds: Set<String> = []
 	var dirty: Set<String> = []
 	private var allDirty = true
 	private var forwardTask: Task<Void, Never>?
 	private var wrapTask: Task<Void, Never>?
+	private var spaceVanishTask: Task<Void, Never>?
 	/// Shared-space reconciles run one at a time, in order.
 	var refreshChain: Task<Void, Never>?
 	/// Invite wraps go out one batch at a time so the sent-map stays idempotent.
@@ -80,6 +88,7 @@ public actor Backend {
 		allDirty = true
 		forwardTask?.cancel()
 		wrapTask?.cancel()
+		spaceVanishTask?.cancel()
 		let commits = await engine.commitUpdates()
 		forwardTask = Task {
 			for await ids in commits {
@@ -90,6 +99,12 @@ public actor Backend {
 		wrapTask = Task {
 			for await event in wraps {
 				await self.handleWrap(event)
+			}
+		}
+		let spaceVanishes = await engine.spaceVanishUpdates()
+		spaceVanishTask = Task {
+			for await spaceId in spaceVanishes {
+				await self.spaceVanishedByOwner(spaceId)
 			}
 		}
 		// The session opens under the keyring's spaces; a second reconcile
@@ -108,6 +123,8 @@ public actor Backend {
 		forwardTask = nil
 		wrapTask?.cancel()
 		wrapTask = nil
+		spaceVanishTask?.cancel()
+		spaceVanishTask = nil
 		await engine.stop()
 		for sink in commitSinks.values { sink.finish() }
 		commitSinks.removeAll()
@@ -142,8 +159,9 @@ public actor Backend {
 	private func imported(_ ids: [String]) async {
 		for id in ids { dirty.insert(id) }
 		notify(ids)
-		// A synced commit on a space object can change members or keys.
-		if ids.contains(where: { states[$0]?.state["typeKey"]?.string == "channel" || (try? keyring.get($0)) != nil }) { scheduleRefreshShared() }
+		// A synced commit on a space object can change members or keys; one on
+		// the ledger can vanish a space.
+		if ids.contains(where: { $0 == vanishLogId || states[$0]?.state["typeKey"]?.string == "channel" || (try? keyring.get($0)) != nil }) { scheduleRefreshShared() }
 	}
 
 	private func notify(_ ids: [String]) {
@@ -194,19 +212,23 @@ public actor Backend {
 	}
 
 	/// The ledger wins over whatever replayed: a relay copy of a vanished object
-	/// can arrive ahead of, or without, the delete change that tombstones it.
+	/// can arrive ahead of, or without, the delete change that tombstones it,
+	/// and an object in a vanished or left space goes with it. A full sweep or
+	/// a ledger change checks every state; otherwise only the touched ones.
 	private func enforceVanished(rebuilt: Bool, touched: [String]) async throws {
-		let ledgerChanged = touched.contains(vanishLogId)
-		if rebuilt || ledgerChanged {
-			let entries = try await Engine.vanished(ledger: states[vanishLogId]?.state)
-			vanished = Set(entries.map(\.objectId))
+		let sweep = rebuilt || touched.contains(vanishLogId)
+		guard sweep || !vanished.isEmpty, let ledger = states[vanishLogId]?.state else { return }
+		let stubs: [JSONValue] = (sweep ? Array(states.keys) : touched).compactMap { id in
+			guard let state = states[id]?.state else { return nil }
+			return .object(["id": .string(id), "channel": .string(state["fields"]?["channel"]?["stringValue"]?.string ?? "")])
 		}
-		if vanished.isEmpty { return }
-		if rebuilt || ledgerChanged {
-			for id in vanished { states[id] = nil }
-		} else {
-			for id in touched where vanished.contains(id) { states[id] = nil }
-		}
+		let entries = try await Engine.vanished(ledger: ledger, objects: stubs)
+		let dropped = Set(entries.map(\.objectId))
+		let left = Set(entries.filter { $0.left == true }.map(\.objectId))
+		// States already dropped are no longer swept: keep what earlier passes found.
+		vanished = rebuilt ? dropped : vanished.union(dropped)
+		leftIds = rebuilt ? left : leftIds.union(left)
+		for id in dropped { states[id] = nil }
 	}
 
 	/// objectId → owning space id ("" = personal). Channels own themselves.
@@ -251,8 +273,35 @@ public actor Backend {
 	/// every planned change (encode → store → publish). Returns the plan's result.
 	/// Key material stays in the host: a rotation plans under the next keyId
 	/// and rotates the keyring only once the engine accepted the request; a
-	/// new channel gets its key right after its creating change.
+	/// new channel gets its key right after its creating change; leaving a
+	/// space drops its key once the ledger entry committed.
 	public func mutate(action: String, params: JSONValue) async throws -> JSONValue {
+		try refuseForeignSpaceAction(action: action, params: params)
+		return try await enqueueMutation(action: action, params: params)
+	}
+
+	/// Only the administrator deletes a space for everyone; only a member leaves one.
+	private func refuseForeignSpaceAction(action: String, params: JSONValue) throws {
+		switch action {
+		case "space_leave":
+			let spaceId = params["channel_id"]?.string ?? ""
+			if !spaceId.isEmpty, spaceOwner(try keyring.get(spaceId)).isEmpty {
+				throw BackendError.refused("space \(spaceId) is administered by this identity: delete it for everyone instead of leaving")
+			}
+		case "vanish":
+			var ids = params["object_ids"]?.array?.compactMap(\.string) ?? []
+			if let id = params["object_id"]?.string { ids.append(id) }
+			let keys = try keyring.all()
+			for id in ids where !spaceOwner(keys[id]).isEmpty {
+				throw BackendError.refused("space \(id) is administered by someone else: leave it instead of deleting it")
+			}
+		default:
+			return
+		}
+	}
+
+	/// Queues a mutation behind the ones already running, unchecked.
+	func enqueueMutation(action: String, params: JSONValue) async throws -> JSONValue {
 		let previous = mutationTail
 		let work = Task {
 			await previous?.value
@@ -281,7 +330,7 @@ public actor Backend {
 			try keyring.rotate(channelId)
 			keyringChanged = true
 		}
-		var touchedSpace = false
+		var touchedShared = false
 		for (index, change) in plan.changes.enumerated() {
 			try await commit(change)
 			guard let objectId = change["objectId"]?.string else { continue }
@@ -289,11 +338,17 @@ public actor Backend {
 				try keyring.ensure(objectId)
 				keyringChanged = true
 			}
-			if spaceOf(objectId) == objectId { touchedSpace = true }
+			// The ledger decides which spaces stay synced.
+			if objectId == vanishLogId || spaceOf(objectId) == objectId { touchedShared = true }
 		}
 		// Browsers enforce the synced ledger locally; native hosts additionally purge files.
 		for change in plan.vanishChanges { try await commit(change) }
-		if keyringChanged || touchedSpace { scheduleRefreshShared() }
+		if !plan.vanishChanges.isEmpty { touchedShared = true }
+		if action == "space_leave" {
+			try keyring.remove(channelId)
+			keyringChanged = true
+		}
+		if keyringChanged || touchedShared { scheduleRefreshShared() }
 		return unpackCoreValueMaps(plan.result)
 	}
 

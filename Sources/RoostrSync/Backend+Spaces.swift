@@ -50,6 +50,8 @@ private let allowlistD = "roostr-allowlist"
 private let wrapsSeenKey = "wraps-seen"
 private let invitesSentKey = "invites-sent"
 private let joinRequestsKey = "join-requests"
+/// Space ids whose stream deletion (kind 5, `#h`) a relay accepted.
+private let spaceDeletesSentKey = "space-deletes-sent"
 private let wrapsSeenLimit = 2000
 private let profileTimeout: Duration = .seconds(3)
 
@@ -81,7 +83,8 @@ extension Backend {
 	/// Build the shared view from local space keys + member fields, hand it to
 	/// the engine, send keys and the relay allowlist for owned spaces, and
 	/// (re)queue every change of a space under its current key: publication
-	/// acknowledgements, not enqueue markers, determine durability.
+	/// acknowledgements, not enqueue markers, determine durability. Vanished
+	/// and left spaces keep their keys but are no longer synced.
 	private func refreshSharedNow() async {
 		do {
 			try await ensure()
@@ -89,8 +92,13 @@ extension Backend {
 			var infos: [SharedSpaceInfo] = []
 			var membersBySpace: [String: [String]] = [:]
 			var nameBySpace: [String: String] = [:]
+			var deleted: [(spaceId: String, keyHex: String)] = []
 			for (spaceId, entry) in try keyring.all().sorted(by: { $0.key < $1.key }) {
 				guard SpaceKey.isHex32(entry.key) else { continue }
+				if vanished.contains(spaceId) {
+					if !leftIds.contains(spaceId) { deleted.append((spaceId, entry.key)) }
+					continue
+				}
 				let state = states[spaceId]?.state
 				var writers = [entry.owner ?? myPk]
 				var memberHexes: [String] = []
@@ -105,6 +113,7 @@ extension Backend {
 				infos.append(SharedSpaceInfo(spaceId: spaceId, keyHex: entry.key, keyId: entry.keyId, writers: writers, owner: entry.owner))
 			}
 			await engine.setSharedSpaces(infos)
+			await publishSpaceDeletes(deleted)
 
 			// Owner duty: every member holds the current key - gift-wrap it to
 			// anyone that hasn't received this keyId yet (adds and rotations).
@@ -147,6 +156,37 @@ extension Backend {
 		if let decoded = try? await Bech32.decode(trimmed), decoded.hrp == "npub" { return decoded.hex }
 		let lower = trimmed.lowercased()
 		return SpaceKey.isHex32(lower) ? lower : nil
+	}
+
+	// ── Vanished spaces ──
+
+	/// The deleting side of a vanished space (contract §5): once per space, a
+	/// kind 5 on its stream tag wipes this identity's events there - and, from
+	/// the administrator, every event that consented to it, and tells members.
+	/// A relay refusal is retried on the next reconcile.
+	private func publishSpaceDeletes(_ spaces: [(spaceId: String, keyHex: String)]) async {
+		if spaces.isEmpty { return }
+		var sent: [String] = (try? await loadMeta(spaceDeletesSentKey, as: [String].self)) ?? []
+		for space in spaces where !sent.contains(space.spaceId) {
+			do {
+				let tag = try await Engine.blind(keyHex: space.keyHex, id: "space:\(space.spaceId)")
+				let tags = [["h", tag], ["k", String(Engine.changeKind)], ["k", String(Engine.checkpointKind)]]
+				let event = try key.sign(kind: Engine.deletionKind, createdAt: Int64(Date().timeIntervalSince1970), tags: tags, content: "space deleted")
+				try await engine.publishEvent(event)
+				sent.append(space.spaceId)
+				try await saveMeta(spaceDeletesSentKey, sent)
+			} catch {
+				continue
+			}
+		}
+	}
+
+	/// The administrator's kind 5 reached a space's stream: the space is gone
+	/// for every member, so it vanishes here too (the administrator alone may
+	/// trigger this, which is why it skips the member guard of `mutate`).
+	func spaceVanishedByOwner(_ spaceId: String) async {
+		guard (try? await ensure()) != nil, !vanished.contains(spaceId) else { return }
+		_ = try? await enqueueMutation(action: "vanish", params: .object(["object_ids": .array([.string(spaceId)])]))
 	}
 
 	// ── Owner duties ──
@@ -204,8 +244,10 @@ extension Backend {
 				let keyHex = payload["key"]?.string, SpaceKey.isHex32(keyHex),
 				let keyId = payload["keyId"]?.int, keyId >= 1
 			else { return }
-			// Only the administrator we already trust may replace a key.
+			// Only the administrator we already trust may replace a key; a
+			// vanished or left space stays gone.
 			if let previous = try? keyring.get(space), rumor.pubkey != (previous.owner ?? key.pubkey) { return }
+			guard (try? await ensure()) != nil, !vanished.contains(space) else { return }
 			guard (try? keyring.import(space, key: keyHex, keyId: keyId, owner: rumor.pubkey)) != nil else { return }
 			scheduleRefreshShared()
 		case joinRequestRumorKind:
@@ -292,10 +334,12 @@ extension Backend {
 
 	/// Accept an invite link (sync.ts importSpaceInvite): store the space key;
 	/// the reconcile backfills the space from the relays. False when the link
-	/// is malformed or names a different administrator than the installed key.
+	/// is malformed, names a different administrator than the installed key,
+	/// or the space was already deleted or left.
 	public func importSpaceInvite(space: String, owner: String, key keyHex: String, keyId: Int64) async -> Bool {
 		guard !space.isEmpty, SpaceKey.isHex32(keyHex), keyId >= 1, let ownerHex = await Self.pubkeyHex(owner) else { return false }
 		if let previous = try? keyring.get(space), (previous.owner ?? key.pubkey) != ownerHex { return false }
+		guard (try? await ensure()) != nil, !vanished.contains(space) else { return false }
 		guard (try? keyring.import(space, key: keyHex, keyId: keyId, owner: ownerHex)) != nil else { return false }
 		scheduleRefreshShared()
 		return true
@@ -305,6 +349,7 @@ extension Backend {
 	/// the first channel is the stable default space of unassigned objects.
 	public func channels() async throws -> [JSONValue] {
 		try await ensure()
+		let keys = try keyring.all()
 		var spaces: [(createdAt: Int64, id: String, json: JSONValue)] = []
 		for (id, cached) in states {
 			let state = cached.state
@@ -319,6 +364,7 @@ extension Backend {
 				"members": .array(Self.members(of: state).map { .object(["npub": .string($0.npub), "role": .string($0.role)]) }),
 				"keyId": .int(fields?["keyId"]?["intValue"]?.int ?? 1),
 				"createdAt": .int(createdAt),
+				"owner": .string(spaceOwner(keys[id])),
 			]
 			// Display order for the rail; absent means "use createdAt".
 			if let order = fields?["order"]?["floatValue"] ?? fields?["order"]?["intValue"] { json["order"] = order }
@@ -326,6 +372,14 @@ extension Backend {
 		}
 		spaces.sort { $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id < $1.id }
 		return spaces.map(\.json)
+	}
+
+	/// The administrator of a space as the UI shows it, from its keyring
+	/// entry: "" when this identity administers it (no imported owner, or one
+	/// naming this identity), else the owner's hex pubkey.
+	func spaceOwner(_ entry: SpaceKey?) -> String {
+		guard let owner = entry?.owner?.lowercased(), owner != key.pubkey else { return "" }
+		return owner
 	}
 
 	// ── Meta helpers ──

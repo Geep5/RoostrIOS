@@ -274,4 +274,118 @@ final class SharedSpacesTests: XCTestCase {
 		XCTAssertFalse(zeroKeyId)
 		await backend.awaitIdle()
 	}
+
+	// ── Delete for everyone ⇄ leave ──
+
+	private func refused(_ action: String, _ params: JSONValue, on backend: Backend, file: StaticString = #filePath, line: UInt = #line) async {
+		do {
+			_ = try await backend.mutate(action: action, params: params)
+			XCTFail("\(action) must be refused", file: file, line: line)
+		} catch BackendError.refused(_) {
+		} catch {
+			XCTFail("\(action): \(error)", file: file, line: line)
+		}
+	}
+
+	func testOwnerDeleteVanishesSpaceForMembersAndLeaveStaysLocal() async throws {
+		let relay = FakeRelay()
+		let owner = try Party(relay: relay)
+		let member = try Party(relay: relay)
+		let leaver = try Party(relay: relay)
+		let memberNpub = try await Bech32.npub(member.key.pubkey)
+		let leaverNpub = try await Bech32.npub(leaver.key.pubkey)
+		func inSpace(_ name: String, _ spaceId: String) -> JSONValue {
+			.object(["name": .string(name), "fields": .object(["channel": .object(["stringValue": .string(spaceId)])])])
+		}
+		func deletions(by party: Party) -> [NostrEvent] {
+			relay.stored.filter { $0.kind == Engine.deletionKind && $0.pubkey == party.key.pubkey }
+		}
+
+		// The owner shares a space with two writers and writes into it.
+		var ob = owner.backend()
+		await ob.start()
+		let created = try await ob.mutate(action: "channel_create", params: .object(["name": .string("Team")]))
+		let spaceId = try XCTUnwrap(created["id"]?.string)
+		for npub in [memberNpub, leaverNpub] {
+			_ = try await ob.mutate(action: "channel_member_add", params: .object(["channel_id": .string(spaceId), "npub": .string(npub), "role": .string("writer")]))
+		}
+		let ownerNote = try await ob.mutate(action: "create", params: inSpace("Owner note", spaceId))
+		let ownerNoteId = try XCTUnwrap(ownerNote["id"]?.string)
+		_ = try await eventually("both invite wraps") { relay.stored.filter { $0.kind == 1059 }.count >= 2 ? true : nil }
+		await ob.awaitIdle()
+		let ownerChannelsBefore = try await ob.channels()
+		let ownerView = try XCTUnwrap(ownerChannelsBefore.first { $0["id"]?.string == spaceId })
+		XCTAssertEqual(ownerView["owner"]?.string, "", "the administrator sees itself as owner")
+		await refused("space_leave", .object(["channel_id": .string(spaceId)]), on: ob)
+		await ob.stop()
+		try await nextSecond()
+
+		// A member sees who administers the space and may not delete it for everyone.
+		var mb = member.backend()
+		await mb.start()
+		let memberView = try await eventually("the member's view of the space") { try await mb.channels().first { $0["id"]?.string == spaceId } }
+		XCTAssertEqual(memberView["owner"]?.string, owner.key.pubkey)
+		await refused("vanish", .object(["object_ids": .array([.string(spaceId)])]), on: mb)
+		let memberNote = try await mb.mutate(action: "create", params: inSpace("Member note", spaceId))
+		let memberNoteId = try XCTUnwrap(memberNote["id"]?.string)
+		await mb.awaitIdle()
+		_ = try await eventually("the member's note on the relay") { relay.stored.contains { $0.kind == 1078 && $0.pubkey == member.key.pubkey } ? true : nil }
+		await mb.stop()
+
+		// Leaving drops the key and hides the space here; nothing is asked of the relays.
+		let lb = leaver.backend()
+		await lb.start()
+		_ = try await eventually("the leaver's import of the owner note") { try await lb.objects().first { $0.id == ownerNoteId } }
+		let left = try await lb.mutate(action: "space_leave", params: .object(["channel_id": .string(spaceId)]))
+		XCTAssertEqual(left["left"]?.string, spaceId)
+		XCTAssertNil(try leaver.keyring.get(spaceId))
+		let leaverChannels = try await lb.channels()
+		XCTAssertFalse(leaverChannels.contains { $0["id"]?.string == spaceId })
+		let leaverObjects = try await lb.objects()
+		XCTAssertFalse(leaverObjects.contains { $0.id == ownerNoteId }, "objects of a left space go with it")
+		await lb.awaitIdle()
+		XCTAssertTrue(deletions(by: leaver).isEmpty, "leaving never deletes relay events")
+		await lb.stop()
+		try await nextSecond()
+
+		// The owner deletes the space for everyone: its objects go, the key
+		// stays, and one stream deletion goes out under the space tag.
+		ob = owner.backend()
+		await ob.start()
+		_ = try await ob.mutate(action: "vanish", params: .object(["object_ids": .array([.string(spaceId)])]))
+		let ownerChannels = try await ob.channels()
+		XCTAssertFalse(ownerChannels.contains { $0["id"]?.string == spaceId })
+		let ownerObjects = try await ob.objects()
+		XCTAssertFalse(ownerObjects.contains { $0.id == ownerNoteId }, "an object in a vanished space vanishes with it")
+		let ownerKey = try XCTUnwrap(try owner.keyring.get(spaceId), "a vanished space keeps its key for its stream tag")
+		let spaceTag = try await Engine.blind(keyHex: ownerKey.key, id: "space:\(spaceId)")
+		let deletion = try await eventually("the owner's stream deletion") { deletions(by: owner).first }
+		XCTAssertEqual(deletion.tags, [["h", spaceTag], ["k", "1078"], ["k", "1079"]])
+		XCTAssertEqual(deletion.content, "space deleted")
+		await ob.awaitIdle()
+		await ob.stop()
+		ob = owner.backend()
+		await ob.start()
+		await ob.awaitIdle()
+		await ob.stop()
+		XCTAssertEqual(deletions(by: owner).count, 1, "the stream deletion goes out once")
+		try await nextSecond()
+
+		// The member reads the owner's deletion off the stream: the space and
+		// everything in it vanish there too, its own note included, and the
+		// member wipes its own events from the stream.
+		mb = member.backend()
+		await mb.start()
+		// The vanish commits the space's tombstone before the ledger entry that
+		// takes everything in it, so wait for the objects, not just the channel.
+		_ = try await eventually("the member's vanish of the space") { try await mb.channels().contains { $0["id"]?.string == spaceId } ? nil : true }
+		_ = try await eventually("the member's own note and the owner's vanish with the space") {
+			try await mb.objects().contains { $0.id == memberNoteId || $0.id == ownerNoteId } ? nil : true
+		}
+		XCTAssertNotNil(try member.keyring.get(spaceId))
+		let memberDeletion = try await eventually("the member's stream deletion") { deletions(by: member).first }
+		XCTAssertEqual(memberDeletion.tag("h"), spaceTag)
+		await mb.awaitIdle()
+		await mb.stop()
+	}
 }
