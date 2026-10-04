@@ -65,6 +65,7 @@ private let wrapLookbackSeconds: Int64 = 3 * 86_400
 
 public actor SyncEngine {
 	private static let pageLimit = 128
+	private static let walkRetryDelay: Duration = .seconds(30)
 	private static let pageSpacing: Duration = .milliseconds(400)
 	private static let publishSpacing: Duration = .milliseconds(120)
 	private static let notifyDebounce: Duration = .milliseconds(100)
@@ -86,6 +87,9 @@ public actor SyncEngine {
 	private var discardedChunkFloor: Int64?
 	private var replayFaultGeneration = 0
 	private var historyComplete = false
+	/// Why the last history walk stopped short ("" once one completes); shown in the status detail.
+	private var lastWalkFailure = ""
+	private var walkRetry: Task<Void, Never>?
 	private var walkCoveredUntil: Int64?
 	private var stopped = false
 	private var liveUp = false
@@ -174,6 +178,8 @@ public actor SyncEngine {
 		stopped = true
 		liveUp = false
 		walkTask?.cancel()
+		walkRetry?.cancel()
+		walkRetry = nil
 		liveTask?.cancel()
 		outboxTask?.cancel()
 		notifyTask?.cancel()
@@ -307,7 +313,9 @@ public actor SyncEngine {
 
 	private func statusDetail() -> String? {
 		if historyComplete { return nil }
-		return "verifying full history in background · \(importedCount) changes\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
+		let progress = "\(importedCount) changes\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
+		if lastWalkFailure.isEmpty { return "loading full history · \(progress)" }
+		return "history incomplete, retrying · \(progress) · \(lastWalkFailure)"
 	}
 
 	private func emitLiveStatus() {
@@ -316,17 +324,39 @@ public actor SyncEngine {
 
 	// ── Backfill ──
 
-	/// Runs one history walk; the caller has counted it in `activeWalks`.
+	/// Runs one history walk; the caller has counted it in `activeWalks`. A
+	/// walk that stops short is walked again from its floor until one
+	/// completes: nothing else would ever finish the history.
 	private func bootstrap(since: Int64, resumeUntil: Int64?, markBootstrapped: Bool) async {
 		defer { activeWalks -= 1 }
 		do {
 			let complete = try await backfill(since: since, resumeUntil: resumeUntil)
 			if stopped { return }
-			if markBootstrapped && complete { try await store.setBootstrapped() }
-			emitLiveStatus()
+			if complete {
+				lastWalkFailure = ""
+				if markBootstrapped { try await store.setBootstrapped() }
+				emitLiveStatus()
+				return
+			}
+			if lastWalkFailure.isEmpty { lastWalkFailure = "a page did not import cleanly" }
 		} catch {
 			if stopped { return }
-			emit(SyncStatus(phase: .error, imported: importedCount, pending: pendingCount, detail: "\(error)"))
+			lastWalkFailure = String(describing: error).prefix(100).description
+		}
+		emitLiveStatus()
+		scheduleWalkRetry()
+	}
+
+	private func scheduleWalkRetry() {
+		guard walkRetry == nil else { return }
+		walkRetry = Task {
+			try? await Task.sleep(for: Self.walkRetryDelay)
+			walkRetry = nil
+			if stopped { return }
+			let bootstrapped = (try? await store.bootstrapped()) ?? false
+			let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
+			activeWalks += 1
+			await bootstrap(since: bootstrapped ? cursor + 1 : 1, resumeUntil: floor, markBootstrapped: !bootstrapped)
 		}
 	}
 
@@ -379,32 +409,18 @@ public actor SyncEngine {
 			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
 			filters.append(NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: ["h": [space.spaceTag]]))
 		}
-		var byId: [String: NostrEvent] = [:]
+		// Imported page by page, never buffered until the walk ends: a phone
+		// that locks or suspends mid-walk keeps every page it fetched, and
+		// spaces appear as their history lands (lib/engine/sync.ts walkHistory).
 		var complete = !relays.isEmpty
-		await withTaskGroup(of: (events: [NostrEvent], complete: Bool).self) { group in
+		try await withThrowingTaskGroup(of: Bool.self) { group in
 			for relay in relays {
 				for filter in filters {
-					group.addTask { await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
+					group.addTask { try await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
 				}
 			}
-			for await result in group {
-				for event in result.events { byId[event.id] = event }
-				if !result.complete { complete = false }
-			}
+			for try await relayComplete in group where !relayComplete { complete = false }
 		}
-
-		var batch: [ImportItem] = []
-		// Checkpoints first within a second: a change the checkpoint already
-		// folds in then lands as covered tail, never as a solitary orphan.
-		let ordered = byId.values.sorted {
-			if $0.created_at != $1.created_at { return $0.created_at < $1.created_at }
-			if $0.kind != $1.kind { return $0.kind > $1.kind }
-			return $0.id < $1.id
-		}
-		for event in ordered {
-			if let item = try await ingest(event) { batch.append(item) }
-		}
-		try await importBatch(batch, immediateNotify: true)
 		// Every relay answered for every filter and nothing faulted: a
 		// CHECKPOINT group still open is missing parts no relay holds (NIP-09
 		// took a superseded checkpoint's chunks; the newer one covers the
@@ -434,32 +450,41 @@ public actor SyncEngine {
 		return historyComplete
 	}
 
-	/// Pages one relay from `resumeUntil` back to `filter.since`; `complete` only on a genuine short page.
-	private func walkRelay(_ relay: RelayClient, filter: NostrFilter, resumeUntil: Int64?, trackFloor: Bool) async -> (events: [NostrEvent], complete: Bool) {
-		var events: [NostrEvent] = []
+	/// Pages one relay from `resumeUntil` back to `filter.since`, importing each
+	/// page; `true` only on a genuine short page. A relay failure ends this
+	/// filter's walk (false); a store failure propagates.
+	private func walkRelay(_ relay: RelayClient, filter: NostrFilter, resumeUntil: Int64?, trackFloor: Bool) async throws -> Bool {
 		var until = resumeUntil
-		do {
-			while true {
-				if stopped { return (events, false) }
-				var page = filter
-				page.until = until
-				page.limit = Self.pageLimit
-				let batch = try await relay.query([page], timeout: Self.queryTimeout)
-				events.append(contentsOf: batch)
-				if batch.count < Self.pageLimit { return (events, true) }
-				let oldest = batch.lazy.map(\.created_at).min()!
-				if let until, oldest >= until { throw SyncError.saturatedPage }
-				until = oldest
-				// Coverage is only as deep as the slowest concurrent walker.
-				if trackFloor {
-					walkCoveredUntil = min(walkCoveredUntil ?? oldest, oldest)
-					try await store.setBootstrapFloor(walkCoveredUntil)
-				}
-				try await Task.sleep(for: Self.pageSpacing)
+		while true {
+			if stopped { return false }
+			var page = filter
+			page.until = until
+			page.limit = Self.pageLimit
+			let batch: [NostrEvent]
+			do {
+				batch = try await relay.query([page], timeout: Self.queryTimeout)
+				if batch.count == Self.pageLimit, let until, batch.lazy.map(\.created_at).min()! >= until { throw SyncError.saturatedPage }
+			} catch {
+				lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
+				return false
 			}
-		} catch {
-			emit(SyncStatus(phase: .backfill, imported: importedCount, pending: pendingCount, detail: "\(relay.url): \(String(describing: error).prefix(100))"))
-			return (events, false)
+			// Checkpoints first within a second: a change the checkpoint already
+			// folds in then lands as covered tail, never as a solitary orphan.
+			var items: [ImportItem] = []
+			for event in batch.sorted(by: { ($0.created_at, -$0.kind, $0.id) < ($1.created_at, -$1.kind, $1.id) }) {
+				if let item = try await ingest(event) { items.append(item) }
+			}
+			try await importBatch(items, immediateNotify: true)
+			emitLiveStatus()
+			if batch.count < Self.pageLimit { return true }
+			let oldest = batch.lazy.map(\.created_at).min()!
+			until = oldest
+			// Coverage is only as deep as the slowest concurrent walker.
+			if trackFloor {
+				walkCoveredUntil = min(walkCoveredUntil ?? oldest, oldest)
+				try await store.setBootstrapFloor(walkCoveredUntil)
+			}
+			try await Task.sleep(for: Self.pageSpacing)
 		}
 	}
 
