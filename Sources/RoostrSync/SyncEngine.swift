@@ -84,6 +84,7 @@ public actor SyncEngine {
 	/// Ids per `REQ {ids}` after a reconciliation: a checkpoint event can run
 	/// to ~40k chars, so 100 stay well inside the relay's 8 MiB response budget.
 	private static let fetchBatch = 100
+	private static let checkpointFetchBatch = 8
 	private static let walkRetryDelay: Duration = .seconds(30)
 	private static let pageSpacing: Duration = .milliseconds(400)
 	private static let publishSpacing: Duration = .milliseconds(120)
@@ -547,10 +548,14 @@ public actor SyncEngine {
 			return .incomplete
 		}
 		var complete = true
-		for start in stride(from: 0, to: need.count, by: Self.fetchBatch) {
+		// Checkpoint events run to ~40k chars each: 100 per REQ is a multi-MB
+		// burst that a slow phone link cannot drain before the relay's send
+		// deadline, so the socket drops and the same batch fails forever.
+		let batchSize = filter.kinds?.contains(Engine.checkpointKind) == true ? Self.checkpointFetchBatch : Self.fetchBatch
+		for start in stride(from: 0, to: need.count, by: batchSize) {
 			if stopped { return .incomplete }
 			if start > 0 { try await Task.sleep(for: Self.pageSpacing) }
-			let ids = Array(need[start..<min(start + Self.fetchBatch, need.count)])
+			let ids = Array(need[start..<min(start + batchSize, need.count)])
 			let wanted = Set(ids)
 			let batch: [NostrEvent]
 			do {
