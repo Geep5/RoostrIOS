@@ -9,9 +9,13 @@ public enum RelayError: Error, Equatable {
 	case rejected(String)
 	/// No pong within the keepalive deadline: the socket is presumed half-open.
 	case unresponsive
+	/// `NEG-ERR` for a reconciliation, with the relay's reason.
+	case negentropy(String)
+	/// The relay answered `NEG-OPEN` with a `NOTICE`: it does not speak NIP-77.
+	case unsupported(String)
 }
 
-/// NIP-01 client over `URLSessionWebSocketTask`. Connects on first use; a
+/// NIP-01 and NIP-77 client over `URLSessionWebSocketTask`. Connects on first use; a
 /// failed socket is dropped so the next call dials again. Transport errors
 /// propagate as thrown by URLSession so callers can tell them from relay
 /// answers. An open socket is pinged every `keepalive`; a missing pong after
@@ -43,6 +47,10 @@ public final class WebSocketRelay: RelayClient, @unchecked Sendable {
 		try await core.publish(event, timeout: timeout)
 	}
 
+	public func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] {
+		try await core.reconcile(filter, local: local, timeout: timeout)
+	}
+
 	public func disconnect() async {
 		await core.disconnect()
 	}
@@ -59,6 +67,13 @@ private struct Waiter<Value> {
 private struct Query {
 	var events: [NostrEvent] = []
 	var waiter = Waiter<[NostrEvent]>()
+}
+
+/// One NIP-77 session awaiting the relay's next NEG-MSG (hex).
+private struct NegSession {
+	var waiter = Waiter<String>()
+	/// NEG-OPEN is still unanswered: a NOTICE now means the verb is unknown.
+	var opening: Bool
 }
 
 private actor Core {
@@ -80,6 +95,7 @@ private actor Core {
 	private var queries: [String: Query] = [:]
 	private var lives: [String: AsyncThrowingStream<NostrEvent, Error>.Continuation] = [:]
 	private var publishes: [String: Waiter<Void>] = [:]
+	private var negs: [String: NegSession] = [:]
 	/// Streams the consumer dropped before their REQ went out.
 	private var abandoned: Set<String> = []
 
@@ -94,6 +110,10 @@ private actor Core {
 		var rng = SystemRandomNumberGenerator()
 		return Hex.encode(Data((0..<8).map { _ in UInt8.random(in: .min ... .max, using: &rng) }))
 	}
+
+	/// Max bytes of one outgoing negentropy message: 500k hex chars, well under
+	/// the relay's 1 MiB message cap.
+	static let negFrameSizeLimit = 250_000
 
 	// MARK: Requests
 
@@ -143,6 +163,55 @@ private actor Core {
 		}
 	}
 
+	/// Runs the initiator side to completion; collects the relay's ids we lack.
+	/// The session is closed on every exit the relay has not closed itself.
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] {
+		var negentropy = try Negentropy(storage: local, frameSizeLimit: Self.negFrameSizeLimit)
+		let id = Self.subscriptionId()
+		var message = try negentropy.initiate()
+		var need: [String] = []
+		var opened = false
+		do {
+			while true {
+				negs[id] = NegSession(opening: !opened)
+				let hex = Hex.encode(Data(message))
+				try await send(opened ? .negMsg(id, hex) : .negOpen(id, filter, hex))
+				opened = true
+				let reply = try await negAnswer(id, timeout: timeout)
+				guard let bytes = Hex.decode(reply) else { throw RelayError.negentropy("malformed NEG-MSG") }
+				let step = try negentropy.reconcile([UInt8](bytes))
+				need += step.needIds
+				guard let next = step.output else { break }
+				message = next
+			}
+		} catch {
+			negs[id] = nil
+			// NEG-ERR ends the session relay-side; a dead socket has none left.
+			let closedByRelay: Bool
+			if case RelayError.negentropy = error { closedByRelay = true } else { closedByRelay = false }
+			if opened, !closedByRelay, socket != nil { try? await send(.negClose(id)) }
+			throw error
+		}
+		negs[id] = nil
+		if socket != nil { try? await send(.negClose(id)) }
+		return need
+	}
+
+	private func negAnswer(_ id: String, timeout: Duration) async throws -> String {
+		let timer = deadline(timeout) { await self.settleNeg(id, .failure(RelayError.timeout)) }
+		defer { timer.cancel() }
+		return try await withCheckedThrowingContinuation { continuation in
+			if let outcome = negs[id]?.waiter.outcome {
+				negs[id] = nil
+				continuation.resume(with: outcome)
+			} else if negs[id] != nil {
+				negs[id]?.waiter.continuation = continuation
+			} else {
+				continuation.resume(throwing: RelayError.timeout)
+			}
+		}
+	}
+
 	// MARK: Settling
 
 	private func settleQuery(_ id: String, _ outcome: Result<[NostrEvent], Error>, close: Bool) {
@@ -165,6 +234,17 @@ private actor Core {
 		} else {
 			waiter.outcome = outcome
 			publishes[id] = waiter
+		}
+	}
+
+	private func settleNeg(_ id: String, _ outcome: Result<String, Error>) {
+		guard var session = negs[id], session.waiter.outcome == nil else { return }
+		if let continuation = session.waiter.continuation {
+			negs[id] = nil
+			continuation.resume(with: outcome)
+		} else {
+			session.waiter.outcome = outcome
+			negs[id] = session
 		}
 	}
 
@@ -247,10 +327,18 @@ private actor Core {
 			if let query = queries[id] { settleQuery(id, .success(query.events), close: true) }
 		case .closed(let id, let message):
 			settleQuery(id, .failure(RelayError.closed(message)), close: false)
+			settleNeg(id, .failure(RelayError.closed(message)))
 			lives.removeValue(forKey: id)?.finish(throwing: RelayError.closed(message))
 		case .ok(let id, let accepted, let message):
 			settlePublish(id, accepted ? .success(()) : .failure(RelayError.rejected(message)))
-		case .notice, .other:
+		case .negMsg(let id, let hex):
+			settleNeg(id, .success(hex))
+		case .negErr(let id, let reason):
+			settleNeg(id, .failure(RelayError.negentropy(reason)))
+		case .notice(let message):
+			// NOTICE names no subscription; it only answers an unanswered NEG-OPEN.
+			for (id, session) in negs where session.opening { settleNeg(id, .failure(RelayError.unsupported(message))) }
+		case .other:
 			break
 		}
 	}
@@ -273,6 +361,7 @@ private actor Core {
 		for (id, _) in queries { settleFailed(&self.queries, id, queries[id]!, error) }
 		for (_, continuation) in lives { continuation.finish(throwing: error) }
 		for (id, _) in publishes { settleFailed(&self.publishes, id, publishes[id]!, error) }
+		for id in Array(negs.keys) { settleNeg(id, .failure(error)) }
 	}
 
 	private func settleFailed(_ store: inout [String: Query], _ id: String, _ query: Query, _ error: Error) {
@@ -292,6 +381,9 @@ private enum ClientFrame: Encodable {
 	case req(String, [NostrFilter])
 	case close(String)
 	case event(NostrEvent)
+	case negOpen(String, NostrFilter, String)
+	case negMsg(String, String)
+	case negClose(String)
 
 	func encode(to encoder: Encoder) throws {
 		var container = encoder.unkeyedContainer()
@@ -306,6 +398,18 @@ private enum ClientFrame: Encodable {
 		case .event(let event):
 			try container.encode("EVENT")
 			try container.encode(event)
+		case .negOpen(let id, let filter, let message):
+			try container.encode("NEG-OPEN")
+			try container.encode(id)
+			try container.encode(filter)
+			try container.encode(message)
+		case .negMsg(let id, let message):
+			try container.encode("NEG-MSG")
+			try container.encode(id)
+			try container.encode(message)
+		case .negClose(let id):
+			try container.encode("NEG-CLOSE")
+			try container.encode(id)
 		}
 	}
 }
@@ -316,6 +420,8 @@ private enum ServerFrame: Decodable {
 	case closed(String, String)
 	case ok(String, Bool, String)
 	case notice(String)
+	case negMsg(String, String)
+	case negErr(String, String)
 	case other
 
 	init(from decoder: Decoder) throws {
@@ -329,6 +435,8 @@ private enum ServerFrame: Decodable {
 			let accepted = try container.decode(Bool.self)
 			self = .ok(id, accepted, container.isAtEnd ? "" : try container.decode(String.self))
 		case "NOTICE": self = .notice(container.isAtEnd ? "" : try container.decode(String.self))
+		case "NEG-MSG": self = .negMsg(try container.decode(String.self), try container.decode(String.self))
+		case "NEG-ERR": self = .negErr(try container.decode(String.self), container.isAtEnd ? "" : try container.decode(String.self))
 		default: self = .other
 		}
 	}

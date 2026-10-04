@@ -105,6 +105,7 @@ final class SyncEngineTests: XCTestCase {
 		let cursor = try await store.cursor()
 		XCTAssertEqual(cursor, relay.stored.last?.created_at)
 
+		let fetchedBefore = relay.fetchedIds.count
 		let second = SyncEngine(key: key, relays: [relay], store: store)
 		await second.start()
 		await second.awaitIdle()
@@ -113,8 +114,10 @@ final class SyncEngineTests: XCTestCase {
 		XCTAssertEqual(live.since, cursor + 1)
 		XCTAssertEqual(live.authors, [key.pubkey])
 		XCTAssertEqual(live.kinds, [1078, 1079], "live carries changes and checkpoints")
-		let walk = try XCTUnwrap(relay.queryFilters.last { $0.authors != nil && $0.kinds == [1078] })
-		XCTAssertEqual(walk.since, cursor + 1)
+		let reconciled = try XCTUnwrap(relay.reconcileFilters.last { $0.authors != nil && $0.kinds == [1078] })
+		XCTAssertNil(reconciled.since, "a restart reconciles the whole stream, not from the cursor")
+		XCTAssertEqual(relay.fetchedIds.count, fetchedBefore, "everything is held: the restart fetches nothing")
+		XCTAssertFalse(relay.queryFilters.contains { $0.limit != nil }, "no paged walk")
 		await second.stop()
 	}
 

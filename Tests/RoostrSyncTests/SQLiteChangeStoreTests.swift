@@ -1,3 +1,4 @@
+import SQLite3
 import XCTest
 import GlonCore
 @testable import RoostrSync
@@ -149,6 +150,50 @@ final class SQLiteChangeStoreTests: XCTestCase {
 		XCTAssertTrue(orphanPublished)
 		let untouched = try await store.pendingPublishes()
 		XCTAssertEqual(untouched.count, 1)
+	}
+
+	func testHeldEventsDedupeAndMatchFilters() async throws {
+		let store = try SQLiteChangeStore.inMemory()
+		let me = String(repeating: "a", count: 64), other = String(repeating: "b", count: 64)
+		let events = [
+			HeldEvent(id: "1", createdAt: 100, kind: 1078, author: me, hTag: "obj"),
+			HeldEvent(id: "2", createdAt: 200, kind: 1079, author: me, hTag: nil),
+			HeldEvent(id: "3", createdAt: 300, kind: 1078, author: me, hTag: "space"),
+			HeldEvent(id: "4", createdAt: 400, kind: 1078, author: other, hTag: "space"),
+			HeldEvent(id: "5", createdAt: 500, kind: 5, author: other, hTag: "space"),
+		]
+		try await store.recordHeld(events)
+		try await store.recordHeld([events[0], HeldEvent(id: "1", createdAt: 999, kind: 1, author: other, hTag: nil)])
+		func ids(_ filter: NostrFilter) async throws -> [String] { try await store.heldEvents(matching: filter).map(\.id).sorted() }
+		let all = try await ids(NostrFilter())
+		XCTAssertEqual(all, ["1", "2", "3", "4", "5"], "first record wins, by id")
+		let selfChanges = try await ids(NostrFilter(authors: [me], kinds: [1078]))
+		XCTAssertEqual(selfChanges, ["1", "3"], "the self stream includes our own space events")
+		let spaceStream = try await ids(NostrFilter(kinds: [1079, 5], tagged: ["h": ["space"]]))
+		XCTAssertEqual(spaceStream, ["5"])
+		let bounded = try await ids(NostrFilter(kinds: [1078], since: 200, until: 300))
+		XCTAssertEqual(bounded, ["3"])
+		let held = try await store.heldEvents(matching: NostrFilter(kinds: [1079]))
+		XCTAssertEqual(held, [events[1]], "a missing h tag reads back as nil")
+	}
+
+	func testOpeningAnOlderDatabaseAddsTheHeldTable() async throws {
+		let dir = FileManager.default.temporaryDirectory.appendingPathComponent("roostr-store-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: dir) }
+		let path = dir.appendingPathComponent("changes.sqlite").path
+		var db: OpaquePointer?
+		XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+		XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('cursor', '42')", nil, nil, nil), SQLITE_OK)
+		sqlite3_close(db)
+
+		let store = try SQLiteChangeStore(path: path)
+		let cursor = try await store.cursor()
+		XCTAssertEqual(cursor, 42)
+		try await store.recordHeld([HeldEvent(id: "x", createdAt: 1, kind: 1078, author: "a", hTag: nil)])
+		let held = try await store.heldEvents(matching: NostrFilter(kinds: [1078]))
+		XCTAssertEqual(held.map(\.id), ["x"])
+		await store.close()
 	}
 
 	func testFileBackedStoreSurvivesReopen() async throws {

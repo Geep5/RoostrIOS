@@ -56,6 +56,22 @@ private struct ImportItem: Sendable {
 	let checkpoint: CheckpointSummary?
 	let chunkKey: String?
 	let provenance: SharedProvenance?
+	/// The relay events this item was read from: held once it imports.
+	let held: [HeldEvent]
+}
+
+/// One stream a history pass covers: the NIP-77 filter and the paged walk's filter.
+private struct HistoryStream: Sendable {
+	let reconcile: NostrFilter
+	let walk: NostrFilter
+}
+
+private enum Reconciled {
+	/// Every id the relay holds beyond ours came back and imported.
+	case complete
+	case incomplete
+	/// No usable NIP-77 answer (NEG-ERR, NOTICE, CLOSED, timeout, bad message): page instead.
+	case unsupported
 }
 
 /// NIP-59 gift wrap: space-key invites and join requests, addressed by pubkey.
@@ -65,6 +81,9 @@ private let wrapLookbackSeconds: Int64 = 3 * 86_400
 
 public actor SyncEngine {
 	private static let pageLimit = 128
+	/// Ids per `REQ {ids}` after a reconciliation: a checkpoint event can run
+	/// to ~40k chars, so 100 stay well inside the relay's 8 MiB response budget.
+	private static let fetchBatch = 100
 	private static let walkRetryDelay: Duration = .seconds(30)
 	private static let pageSpacing: Duration = .milliseconds(400)
 	private static let publishSpacing: Duration = .milliseconds(120)
@@ -89,6 +108,8 @@ public actor SyncEngine {
 	private var historyComplete = false
 	/// Why the last history walk stopped short ("" once one completes); shown in the status detail.
 	private var lastWalkFailure = ""
+	/// The checkpoint pass of a walk has run: every object has its cached state, history is still streaming in.
+	private var checkpointsLoaded = false
 	private var walkRetry: Task<Void, Never>?
 	private var walkCoveredUntil: Int64?
 	private var stopped = false
@@ -116,6 +137,10 @@ public actor SyncEngine {
 	private var cursorChain: Task<Void, Never>?
 	private var notifyTask: Task<Void, Never>?
 	private var pendingObjects: Set<String> = []
+	/// Relays that answered NEG-OPEN with a NOTICE: this process pages them.
+	private var negentropyUnsupported: Set<URL> = []
+	/// Held events of chunk groups still assembling, by `pubkey/kind/gid`.
+	private var heldParts: [String: [HeldEvent]] = [:]
 
 	private var lastStatus = SyncStatus(phase: .idle)
 	private var statusSinks: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
@@ -154,8 +179,10 @@ public actor SyncEngine {
 		// The incremental `since = cursor+1` shortcut is only sound once ONE full
 		// history walk has completed on this device: the cursor tracks the newest
 		// imported event, so an interrupted first bootstrap would otherwise skip
-		// everything older, forever. The walk runs in the background; live
-		// subscriptions come up first and imports dedupe against its pages.
+		// everything older, forever. It only applies to relays paged without
+		// NIP-77: a reconciliation always compares a stream's whole set. The
+		// walk runs in the background; live subscriptions come up first and
+		// imports dedupe against its pages.
 		let bootstrapped = (try? await store.bootstrapped()) ?? false
 		let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
 		let since: Int64 = bootstrapped ? cursor + 1 : 1
@@ -314,7 +341,7 @@ public actor SyncEngine {
 	private func statusDetail() -> String? {
 		if historyComplete { return nil }
 		let progress = "\(importedCount) changes\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
-		if lastWalkFailure.isEmpty { return "loading full history · \(progress)" }
+		if lastWalkFailure.isEmpty { return checkpointsLoaded ? "verifying full history · \(progress)" : "loading spaces · \(progress)" }
 		return "history incomplete, retrying · \(progress) · \(lastWalkFailure)"
 	}
 
@@ -377,7 +404,8 @@ public actor SyncEngine {
 		return try await task.value.get()
 	}
 
-	/// Returns true only when EVERY relay was walked to exhaustion.
+	/// Returns true only when EVERY relay was reconciled (NIP-77) or walked to
+	/// exhaustion for every stream.
 	private func walkHistory(since: Int64, resumeUntil: Int64?) async throws -> Bool {
 		historyComplete = false
 		// A full-history walk persists its progress page by page: a phone that
@@ -400,26 +428,51 @@ public actor SyncEngine {
 		// walked unbounded. Resolved once per scope and remembered, so a later
 		// repair walk never widens back to event zero.
 		let full = since <= 1
-		var filters = [
-			NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: full ? max(since, await checkpointFloor(scope: "", space: nil)) : since),
-			NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since),
-		]
+		// Checkpoints are walked to the end FIRST: every object renders from its
+		// cache within a few pages, then the change history streams in behind
+		// (docs/checkpoint-sync.md - a checkpoint never shortens the history).
+		// A reconciliation always covers a stream's whole set, so its filter
+		// takes the full walk's bounds whatever `since` an incremental walk uses.
+		let selfFloor = await checkpointFloor(scope: "", space: nil)
+		var checkpointStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind]),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since)
+		)]
+		var changeStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: selfFloor > 0 ? selfFloor : nil),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: full ? max(since, selfFloor) : since)
+		)]
 		for space in spaces.values {
-			filters.append(NostrFilter(kinds: [Engine.changeKind], since: full ? max(since, await checkpointFloor(scope: space.spaceTag, space: space)) : since, tagged: ["h": [space.spaceTag]]))
+			let floor = await checkpointFloor(scope: space.spaceTag, space: space)
+			let tagged = ["h": [space.spaceTag]]
+			changeStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.changeKind], since: floor > 0 ? floor : nil, tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.changeKind], since: full ? max(since, floor) : since, tagged: tagged)
+			))
 			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
-			filters.append(NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: ["h": [space.spaceTag]]))
+			checkpointStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: tagged)
+			))
 		}
-		// Imported page by page, never buffered until the walk ends: a phone
+		// Imported batch by batch, never buffered until the pass ends: a phone
 		// that locks or suspends mid-walk keeps every page it fetched, and
 		// spaces appear as their history lands (lib/engine/sync.ts walkHistory).
+		// The checkpoint pass is short and re-walked whole on every resume, so
+		// it neither starts from nor moves the bootstrap floor, which belongs
+		// to the change walk alone.
 		var complete = !relays.isEmpty
-		try await withThrowingTaskGroup(of: Bool.self) { group in
-			for relay in relays {
-				for filter in filters {
-					group.addTask { try await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
+		for (streams, resume, track) in [(checkpointStreams, nil as Int64?, false), (changeStreams, resumeUntil, trackFloor)] {
+			try await withThrowingTaskGroup(of: Bool.self) { group in
+				for relay in relays {
+					group.addTask { try await self.syncRelay(relay, streams: streams, resumeUntil: resume, trackFloor: track) }
 				}
+				for try await relayComplete in group where !relayComplete { complete = false }
 			}
-			for try await relayComplete in group where !relayComplete { complete = false }
+			if !checkpointsLoaded {
+				checkpointsLoaded = true
+				emitLiveStatus()
+			}
 		}
 		// Every relay answered for every filter and nothing faulted: a
 		// CHECKPOINT group still open is missing parts no relay holds (NIP-09
@@ -450,6 +503,72 @@ public actor SyncEngine {
 		return historyComplete
 	}
 
+	/// Reconciles `streams` with `relay` one at a time (the relay caps NIP-77
+	/// sessions per connection), then pages, concurrently, every stream it
+	/// could not reconcile. True only when every stream completed.
+	private func syncRelay(_ relay: RelayClient, streams: [HistoryStream], resumeUntil: Int64?, trackFloor: Bool) async throws -> Bool {
+		var complete = true
+		var walks: [NostrFilter] = []
+		for stream in streams {
+			switch try await reconcileRelay(relay, filter: stream.reconcile) {
+			case .complete: break
+			case .incomplete: complete = false
+			case .unsupported: walks.append(stream.walk)
+			}
+		}
+		if walks.isEmpty { return complete }
+		return try await withThrowingTaskGroup(of: Bool.self) { group in
+			for filter in walks {
+				group.addTask { try await self.walkRelay(relay, filter: filter, resumeUntil: resumeUntil, trackFloor: trackFloor) }
+			}
+			for try await walked in group where !walked { complete = false }
+			return complete
+		}
+	}
+
+	/// NIP-77 against the events this device holds for `filter`, then the
+	/// relay's surplus fetched by id and imported batch by batch. A relay
+	/// failure or an id the relay does not return leaves the stream
+	/// incomplete; a store failure propagates.
+	private func reconcileRelay(_ relay: RelayClient, filter: NostrFilter) async throws -> Reconciled {
+		if stopped { return .incomplete }
+		if negentropyUnsupported.contains(relay.url) { return .unsupported }
+		let local = try NegentropyStorage(try await store.heldEvents(matching: filter).map { ($0.createdAt, $0.id) })
+		let need: [String]
+		do {
+			need = try await relay.reconcile(filter, local: local, timeout: Self.queryTimeout)
+		} catch RelayError.unsupported {
+			negentropyUnsupported.insert(relay.url)
+			return .unsupported
+		} catch RelayError.negentropy, RelayError.closed, RelayError.timeout, is NegentropyError {
+			return .unsupported
+		} catch {
+			lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
+			return .incomplete
+		}
+		var complete = true
+		for start in stride(from: 0, to: need.count, by: Self.fetchBatch) {
+			if stopped { return .incomplete }
+			if start > 0 { try await Task.sleep(for: Self.pageSpacing) }
+			let ids = Array(need[start..<min(start + Self.fetchBatch, need.count)])
+			let wanted = Set(ids)
+			let batch: [NostrEvent]
+			do {
+				batch = try await relay.query([NostrFilter(ids: ids)], timeout: Self.queryTimeout).filter { wanted.contains($0.id) }
+			} catch {
+				lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
+				return .incomplete
+			}
+			let missing = wanted.subtracting(batch.map(\.id)).count
+			if missing > 0 {
+				complete = false
+				lastWalkFailure = "\(relay.url): \(missing) reconciled events not returned"
+			}
+			try await importEvents(batch)
+		}
+		return complete ? .complete : .incomplete
+	}
+
 	/// Pages one relay from `resumeUntil` back to `filter.since`, importing each
 	/// page; `true` only on a genuine short page. A relay failure ends this
 	/// filter's walk (false); a store failure propagates.
@@ -468,14 +587,7 @@ public actor SyncEngine {
 				lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
 				return false
 			}
-			// Checkpoints first within a second: a change the checkpoint already
-			// folds in then lands as covered tail, never as a solitary orphan.
-			var items: [ImportItem] = []
-			for event in batch.sorted(by: { ($0.created_at, -$0.kind, $0.id) < ($1.created_at, -$1.kind, $1.id) }) {
-				if let item = try await ingest(event) { items.append(item) }
-			}
-			try await importBatch(items, immediateNotify: true)
-			emitLiveStatus()
+			try await importEvents(batch)
 			if batch.count < Self.pageLimit { return true }
 			let oldest = batch.lazy.map(\.created_at).min()!
 			until = oldest
@@ -486,6 +598,18 @@ public actor SyncEngine {
 			}
 			try await Task.sleep(for: Self.pageSpacing)
 		}
+	}
+
+	/// Ingests and imports one fetched batch, then reports progress.
+	private func importEvents(_ batch: [NostrEvent]) async throws {
+		// Checkpoints first within a second: a change the checkpoint already
+		// folds in then lands as covered tail, never as a solitary orphan.
+		var items: [ImportItem] = []
+		for event in batch.sorted(by: { ($0.created_at, -$0.kind, $0.id) < ($1.created_at, -$1.kind, $1.id) }) {
+			if let item = try await ingest(event) { items.append(item) }
+		}
+		try await importBatch(items, immediateNotify: true)
+		emitLiveStatus()
 	}
 
 	// ── Checkpoint manifest ──
@@ -540,6 +664,8 @@ public actor SyncEngine {
 	/// Feed one signature-verified relay event to the session; returns the
 	/// decoded payload when a full change or checkpoint (possibly reassembled)
 	/// is available. A space administrator's kind 5 goes to the vanish sinks.
+	/// An event the session consumed cleanly becomes held: with its item once
+	/// that imports, with its group's item for a chunk part, else at once.
 	private func ingest(_ event: NostrEvent) async throws -> ImportItem? {
 		guard event.kind == Engine.changeKind || event.kind == Engine.checkpointKind || event.kind == Engine.deletionKind, NostrKey.verify(event) else { return nil }
 		guard sessionOpen else { return nil } // stopped or retired
@@ -550,13 +676,21 @@ public actor SyncEngine {
 		if let spaceId = r.spaceVanished {
 			for sink in spaceVanishSinks.values { sink.yield(spaceId) }
 		}
-		guard let item = r.item else { return nil }
+		let held = HeldEvent(event)
+		let group = event.tags.first { $0.first == "c" && $0.count > 1 }.map { "\(event.pubkey)/\(event.kind)/\($0[1])" }
+		guard let item = r.item else {
+			if r.faultAt == nil && r.decryptFailure != true && r.decodeFailure != true {
+				if let group { heldParts[group, default: []].append(held) } else { try await store.recordHeld([held]) }
+			}
+			return nil
+		}
 		guard let bytes = Data(base64Encoded: item.bytes) else { throw SyncError.malformedChange }
 		let objectId: String
 		if let checkpoint = item.checkpoint { objectId = checkpoint.objectId }
 		else if let id = item.change?["objectId"]?.string { objectId = id }
 		else { throw SyncError.malformedChange }
-		return ImportItem(objectId: objectId, bytes: bytes, base64: item.bytes, change: item.change, checkpoint: item.checkpoint, chunkKey: item.chunkKey, provenance: item.provenance)
+		let parts = group.flatMap { heldParts.removeValue(forKey: $0) } ?? []
+		return ImportItem(objectId: objectId, bytes: bytes, base64: item.bytes, change: item.change, checkpoint: item.checkpoint, chunkKey: item.chunkKey, provenance: item.provenance, held: parts + [held])
 	}
 
 	/// Report a reassembled group's import outcome to the session.
@@ -630,6 +764,7 @@ public actor SyncEngine {
 			try await store.markPublished(key: publishKey)
 			pendingObjects.insert(item.objectId)
 		}
+		try await store.recordHeld(item.held)
 		if let chunkKey = item.chunkKey {
 			settled.insert(chunkKey)
 			await settle(chunkKey, imported: true)
@@ -986,6 +1121,8 @@ public actor SyncEngine {
 				try await publishToAnyRelay(event)
 				if events.count > 1 { try await Task.sleep(for: Self.publishSpacing) }
 			}
+			// A relay holds them now: a reconciliation must not fetch them back.
+			try await store.recordHeld(events.map(HeldEvent.init))
 			try await store.markPublished(key: item.key)
 			return (true, sealed)
 		} catch {

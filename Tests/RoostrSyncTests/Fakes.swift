@@ -3,7 +3,8 @@ import GlonCore
 @testable import RoostrSync
 
 /// In-memory NIP-01 relay: stores accepted events, answers queries newest
-/// first, fans published events out to matching live subscriptions.
+/// first, fans published events out to matching live subscriptions. NIP-77
+/// runs the reference-exact `Negentropy` server side over the stored matches.
 final class FakeRelay: RelayClient, @unchecked Sendable {
 	struct Rejecting: Error {}
 
@@ -14,6 +15,9 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 	private var accepting = true
 	private var queried: [NostrFilter] = []
 	private var subscribed: [NostrFilter] = []
+	private var reconciled: [NostrFilter] = []
+	private var negentropyFailure: Error?
+	private var withheld: Set<String> = []
 
 	init(url: URL = URL(string: "ws://fake.relay")!) {
 		self.url = url
@@ -26,6 +30,19 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 
 	var queryFilters: [NostrFilter] { lock.withLock { queried } }
 	var subscribeFilters: [NostrFilter] { lock.withLock { subscribed } }
+	var reconcileFilters: [NostrFilter] { lock.withLock { reconciled } }
+	/// Ids requested by `REQ {ids}` so far.
+	var fetchedIds: [String] { lock.withLock { queried.flatMap { $0.ids ?? [] } } }
+
+	/// Every reconcile throws `failure` (e.g. `RelayError.negentropy` for NEG-ERR); nil restores NIP-77.
+	func failNegentropy(_ failure: Error?) {
+		lock.withLock { negentropyFailure = failure }
+	}
+
+	/// Queries leave these ids out though reconciliation still reports them.
+	func withhold(_ ids: Set<String>) {
+		lock.withLock { withheld = ids }
+	}
 
 	func setAccepting(_ accepting: Bool) {
 		lock.withLock { self.accepting = accepting }
@@ -34,7 +51,7 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 	func query(_ filters: [NostrFilter], timeout: Duration) async throws -> [NostrEvent] {
 		lock.withLock {
 			queried.append(contentsOf: filters)
-			var matched = events.values.filter { event in filters.contains { Self.matches($0, event) } }
+			var matched = events.values.filter { event in !withheld.contains(event.id) && filters.contains { Self.matches($0, event) } }
 			matched.sort { $0.created_at != $1.created_at ? $0.created_at > $1.created_at : $0.id > $1.id }
 			if let limit = filters.compactMap(\.limit).min(), matched.count > limit { matched.removeLast(matched.count - limit) }
 			return matched
@@ -62,6 +79,25 @@ final class FakeRelay: RelayClient, @unchecked Sendable {
 			return subscriptions.values.filter { sub in sub.filters.contains { Self.matches($0, event) } }.map(\.continuation)
 		}
 		for listener in listeners { listener.yield(event) }
+	}
+
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] {
+		let (failure, matched) = lock.withLock {
+			reconciled.append(filter)
+			return (negentropyFailure, events.values.filter { Self.matches(filter, $0) })
+		}
+		if let failure { throw failure }
+		var server = try Negentropy(storage: NegentropyStorage(matched.map { ($0.created_at, $0.id) }))
+		var client = try Negentropy(storage: local, frameSizeLimit: 250_000)
+		var need: [String] = []
+		var message = try client.initiate()
+		while true {
+			guard let reply = try server.reconcile(message).output else { throw RelayError.negentropy("no answer") }
+			let step = try client.reconcile(reply)
+			need += step.needIds
+			guard let next = step.output else { return need }
+			message = next
+		}
 	}
 
 	/// Every live subscription fails as a dropped socket would; stored events stay.
@@ -115,6 +151,11 @@ final class StallingRelay: RelayClient, @unchecked Sendable {
 		return try await relay.query(filters, timeout: timeout)
 	}
 
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] {
+		if isStalled { throw RelayError.timeout }
+		return try await relay.reconcile(filter, local: local, timeout: timeout)
+	}
+
 	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error> {
 		let id = UUID()
 		let (stream, continuation) = AsyncThrowingStream<NostrEvent, Error>.makeStream()
@@ -165,6 +206,7 @@ actor InMemoryChangeStore: ChangeStore {
 	private var published: Set<String> = []
 	private var checkpoints: [String: CheckpointRecord] = [:]
 	private var floors: [String: Int64] = [:]
+	private var held: [String: HeldEvent] = [:]
 
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int {
 		var added = 0
@@ -207,4 +249,21 @@ actor InMemoryChangeStore: ChangeStore {
 		published.insert(key)
 		pendings[key] = nil
 	}
+
+	func recordHeld(_ events: [HeldEvent]) async throws {
+		for event in events where held[event.id] == nil { held[event.id] = event }
+	}
+
+	func heldEvents(matching filter: NostrFilter) async throws -> [HeldEvent] {
+		held.values.filter { event in
+			if let kinds = filter.kinds, !kinds.contains(event.kind) { return false }
+			if let authors = filter.authors, !authors.contains(event.author) { return false }
+			if let tags = filter.tagged["h"], !tags.contains(event.hTag ?? "") { return false }
+			if let since = filter.since, event.createdAt < since { return false }
+			if let until = filter.until, event.createdAt > until { return false }
+			return true
+		}
+	}
+
+	var heldCount: Int { held.count }
 }

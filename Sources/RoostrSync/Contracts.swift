@@ -69,10 +69,34 @@ public protocol RelayClient: Sendable {
 	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error>
 	/// Resolves when the relay answers `OK true`; throws with the relay's message on `OK false` or timeout.
 	func publish(_ event: NostrEvent, timeout: Duration) async throws
+	/// NIP-77: reconciles the relay's stored events matching `filter` against
+	/// `local` and returns the ids the relay holds that `local` lacks. Every
+	/// relay answer must arrive within `timeout`. Throws `RelayError.negentropy`
+	/// on NEG-ERR, `.unsupported` when the relay answers NEG-OPEN with a
+	/// NOTICE, `.timeout`, or the transport error of a dropped socket.
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String]
 	/// Drops the connection: everything in flight fails and the next call dials
 	/// again. A socket that outlived an app suspension or a network change can
 	/// be half-open and never fail by itself.
 	func disconnect() async
+}
+
+/// A relay event this device holds (imported from a relay or published by it):
+/// its side of a NIP-77 reconciliation. `hTag` is the event's first `h` tag.
+public struct HeldEvent: Sendable, Equatable {
+	public var id: String
+	public var createdAt: Int64
+	public var kind: Int
+	public var author: String
+	public var hTag: String?
+
+	public init(id: String, createdAt: Int64, kind: Int, author: String, hTag: String?) {
+		self.id = id; self.createdAt = createdAt; self.kind = kind; self.author = author; self.hTag = hTag
+	}
+
+	public init(_ event: NostrEvent) {
+		self.init(id: event.id, createdAt: event.created_at, kind: event.kind, author: event.pubkey, hTag: event.tag("h"))
+	}
 }
 
 /// One stored change: exact wire bytes plus the engine's decoded JSON (`codec decode` shape).
@@ -149,6 +173,12 @@ public protocol ChangeStore: Sendable {
 	func isPublished(key: String) async throws -> Bool
 	/// Marks published and removes any pending record for the key.
 	func markPublished(key: String) async throws
+
+	/// Remembers relay events this device holds; idempotent by id.
+	func recordHeld(_ events: [HeldEvent]) async throws
+	/// Held events matching `filter`'s `kinds`, `authors`, `#h`, `since` and
+	/// `until` (other fields are ignored): the local set of a reconciliation.
+	func heldEvents(matching filter: NostrFilter) async throws -> [HeldEvent]
 }
 
 public enum SyncPhase: String, Sendable {

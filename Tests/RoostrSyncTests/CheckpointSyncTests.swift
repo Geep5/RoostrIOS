@@ -101,7 +101,7 @@ final class CheckpointSyncTests: XCTestCase {
 
 	// ── Cold start ──
 
-	func testColdStartImportsCheckpointAndWalksChangesFromManifestFloor() async throws {
+	func testColdStartImportsCheckpointAndReconcilesChangesFromManifestFloor() async throws {
 		let relay = FakeRelay()
 		let create = try await change("doc", ops: [.object(["objectCreate": .object(["typeKey": .string("note")])]), setName("v1")])
 		let edit = try await change("doc", ops: [setName("v2")], parents: [create.id])
@@ -124,9 +124,11 @@ final class CheckpointSyncTests: XCTestCase {
 		XCTAssertEqual(held?.heads, [create.id])
 		let changes = try await store.changesFor(objectId: "doc")
 		XCTAssertEqual(changes.map(\.id), [edit.id], "only the tail past the floor is stored; the covered change is not")
-		let walk = relay.queryFilters.filter { $0.kinds == [Engine.changeKind] && $0.authors != nil }
-		XCTAssertTrue(walk.allSatisfy { $0.since == 150 }, "kind-1078 is walked from the manifest cursor, not genesis: \(walk.map(\.since))")
-		XCTAssertTrue(relay.queryFilters.contains { $0.kinds == [Engine.checkpointKind] && ($0.since ?? 0) <= 1 }, "kind-1079 is walked unbounded")
+		let reconciled = relay.reconcileFilters.filter { $0.kinds == [Engine.changeKind] && $0.authors != nil }
+		XCTAssertFalse(reconciled.isEmpty)
+		XCTAssertTrue(reconciled.allSatisfy { $0.since == 150 }, "kind-1078 is reconciled from the manifest cursor, not genesis: \(reconciled.map(\.since))")
+		XCTAssertTrue(relay.reconcileFilters.contains { $0.kinds == [Engine.checkpointKind] && $0.since == nil }, "kind-1079 is reconciled unbounded")
+		XCTAssertFalse(relay.fetchedIds.contains(oldChange.id), "the covered change is never fetched")
 		let live = try XCTUnwrap(relay.subscribeFilters.first { $0.authors != nil })
 		XCTAssertEqual(live.kinds, [Engine.changeKind, Engine.checkpointKind])
 		XCTAssertGreaterThanOrEqual(live.since ?? 0, 150, "live never reaches below a publisher's floor")

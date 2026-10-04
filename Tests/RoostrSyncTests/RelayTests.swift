@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import XCTest
@@ -149,6 +150,124 @@ final class RelayKeepaliveTests: XCTestCase {
 	}
 }
 
+/// `WebSocketRelay.reconcile` against scripted local endpoints: the frames on
+/// the wire, NEG-ERR / NOTICE / silence, and a socket dropped mid-session.
+final class RelayNegentropyTests: XCTestCase {
+	private static func id(_ i: Int) -> String { Hex.encode(Data(SHA256.hash(data: Data("neg-\(i)".utf8)))) }
+
+	private static func frame(_ text: String) -> [Any] {
+		(try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [Any] ?? []
+	}
+
+	private static func json(_ value: [Any]) -> String {
+		String(decoding: try! JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+	}
+
+	/// A NIP-77 relay over `storage` speaking through `MuteWebSocketServer`.
+	private final class ScriptedRelay: @unchecked Sendable {
+		private let storage: NegentropyStorage
+		private let lock = NSLock()
+		private var sessions: [String: Negentropy] = [:]
+		private var filters: [[String: Any]] = []
+		private var verbs: [String] = []
+
+		init(_ storage: NegentropyStorage) { self.storage = storage }
+
+		var seen: [String] { lock.withLock { verbs } }
+		var openFilters: [[String: Any]] { lock.withLock { filters } }
+
+		func respond(_ text: String) -> [String] {
+			let frame = RelayNegentropyTests.frame(text)
+			guard frame.count >= 2, let verb = frame[0] as? String, let sub = frame[1] as? String else { return [] }
+			return lock.withLock {
+				verbs.append(verb)
+				if verb == "NEG-OPEN", let filter = frame[2] as? [String: Any] {
+					filters.append(filter)
+					sessions[sub] = try? Negentropy(storage: storage)
+				}
+				guard verb == "NEG-OPEN" || verb == "NEG-MSG" else {
+					sessions[sub] = nil
+					return []
+				}
+				guard let message = frame.last as? String, let bytes = Hex.decode(message),
+				      let reply = try? sessions[sub]?.reconcile([UInt8](bytes)).output else { return [] }
+				return [RelayNegentropyTests.json(["NEG-MSG", sub, Hex.encode(Data(reply))])]
+			}
+		}
+	}
+
+	func testReconcileReturnsWhatTheRelayHoldsBeyondOurs() async throws {
+		let relayItems: [(createdAt: Int64, id: String)] = (0..<300).map { (Int64(1_700_000_000 + $0 / 3), Self.id($0)) }
+		let ours: [(createdAt: Int64, id: String)] = relayItems.enumerated().filter { $0.offset % 7 != 0 }.map(\.element) + [(1_600_000_000, Self.id(-1))]
+		let scripted = ScriptedRelay(try NegentropyStorage(relayItems))
+		let server = try MuteWebSocketServer(answersPings: true, respond: scripted.respond)
+		defer { server.stop() }
+		let relay = WebSocketRelay(url: try await server.start())
+		let need = try await relay.reconcile(NostrFilter(kinds: [1078]), local: try NegentropyStorage(ours), timeout: .seconds(5))
+		let expected = relayItems.enumerated().filter { $0.offset % 7 == 0 }.map(\.element.id)
+		XCTAssertEqual(Set(need), Set(expected))
+		try await Task.sleep(for: .milliseconds(100))
+		XCTAssertEqual(scripted.openFilters.first?["kinds"] as? [Int], [1078], "the filter rides along")
+		XCTAssertEqual(scripted.seen.first, "NEG-OPEN")
+		XCTAssertEqual(scripted.seen.last, "NEG-CLOSE", "a finished session is closed")
+	}
+
+	func testNegErrAndNoticeAndSilenceFailTheReconcile() async throws {
+		let local = try NegentropyStorage([])
+		let negErr = try MuteWebSocketServer(answersPings: true) { text in
+			[Self.json(["NEG-ERR", Self.frame(text)[1], "blocked: too many records"])]
+		}
+		defer { negErr.stop() }
+		do {
+			_ = try await WebSocketRelay(url: try await negErr.start()).reconcile(NostrFilter(kinds: [1]), local: local, timeout: .seconds(5))
+			XCTFail("NEG-ERR must fail the reconcile")
+		} catch {
+			XCTAssertEqual(error as? RelayError, .negentropy("blocked: too many records"))
+		}
+
+		let notice = try MuteWebSocketServer(answersPings: true) { _ in [Self.json(["NOTICE", "unknown message type"])] }
+		defer { notice.stop() }
+		do {
+			_ = try await WebSocketRelay(url: try await notice.start()).reconcile(NostrFilter(kinds: [1]), local: local, timeout: .seconds(5))
+			XCTFail("a NOTICE answering NEG-OPEN must fail the reconcile")
+		} catch {
+			XCTAssertEqual(error as? RelayError, .unsupported("unknown message type"))
+		}
+
+		let silent = try MuteWebSocketServer(answersPings: true)
+		defer { silent.stop() }
+		do {
+			_ = try await WebSocketRelay(url: try await silent.start()).reconcile(NostrFilter(kinds: [1]), local: local, timeout: .milliseconds(300))
+			XCTFail("an unanswered NEG-OPEN must time out")
+		} catch {
+			XCTAssertEqual(error as? RelayError, .timeout)
+		}
+	}
+
+	func testDroppedSocketFailsTheReconcileAndTheNextCallRedials() async throws {
+		let server = try MuteWebSocketServer(answersPings: true)
+		defer { server.stop() }
+		let relay = WebSocketRelay(url: try await server.start())
+		let pending = Task { try await relay.reconcile(NostrFilter(kinds: [1]), local: try NegentropyStorage([]), timeout: .seconds(30)) }
+		try await Task.sleep(for: .milliseconds(300))
+		let started = ContinuousClock.now
+		server.dropConnections()
+		do {
+			_ = try await pending.value
+			XCTFail("a dropped socket must fail the reconcile")
+		} catch {
+			XCTAssertNil(error as? RelayError, "a transport error, not a relay answer: \(error)")
+		}
+		XCTAssertLessThan(ContinuousClock.now - started, .seconds(5), "fails at once, not at the timeout")
+		// The same instance dials again.
+		do {
+			_ = try await relay.reconcile(NostrFilter(kinds: [1]), local: try NegentropyStorage([]), timeout: .milliseconds(300))
+		} catch {
+			XCTAssertEqual(error as? RelayError, .timeout, "the next call reaches the (silent) endpoint again")
+		}
+	}
+}
+
 /// How a live stream ended, if it has.
 private final class StreamOutcome: @unchecked Sendable {
 	private let lock = NSLock()
@@ -170,12 +289,17 @@ private final class StreamOutcome: @unchecked Sendable {
 	func cancel() { task?.cancel() }
 }
 
+/// Local WebSocket endpoint that reads every frame; `respond` (on the
+/// server's queue) turns each text frame into the text frames sent back.
+/// Without it, it never answers NIP-01.
 private final class MuteWebSocketServer: @unchecked Sendable {
 	private let listener: NWListener
 	private let queue = DispatchQueue(label: "mute-websocket")
 	private var connections: [NWConnection] = []
+	private let respond: ((String) -> [String])?
 
-	init(answersPings: Bool) throws {
+	init(answersPings: Bool, respond: ((String) -> [String])? = nil) throws {
+		self.respond = respond
 		let websocket = NWProtocolWebSocket.Options()
 		websocket.autoReplyPing = answersPings
 		let parameters = NWParameters.tcp
@@ -203,8 +327,24 @@ private final class MuteWebSocketServer: @unchecked Sendable {
 	}
 
 	private func drain(_ connection: NWConnection) {
-		connection.receiveMessage { [weak self] _, _, _, error in
-			if error == nil { self?.drain(connection) }
+		connection.receiveMessage { [weak self] content, _, _, error in
+			guard error == nil, let self else { return }
+			if let respond = self.respond, let content, let text = String(data: content, encoding: .utf8) {
+				for reply in respond(text) {
+					let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+					let context = NWConnection.ContentContext(identifier: "text", metadata: [metadata])
+					connection.send(content: Data(reply.utf8), contentContext: context, isComplete: true, completion: .idempotent)
+				}
+			}
+			self.drain(connection)
+		}
+	}
+
+	/// Drops every accepted socket, as a relay restart or a dead network would.
+	func dropConnections() {
+		queue.sync {
+			for connection in connections { connection.cancel() }
+			connections.removeAll()
 		}
 	}
 

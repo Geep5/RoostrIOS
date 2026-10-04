@@ -18,8 +18,9 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 /// `ChangeStore` over the system SQLite. Three tables mirror the browser's
 /// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order),
-/// `checkpoints` (one per object) and `meta` (string key/value). Statements are
-/// prepared once and reused.
+/// `checkpoints` (one per object) and `meta` (string key/value); `held` lists
+/// the relay events this device holds, for NIP-77. Statements are prepared
+/// once and reused.
 public actor SQLiteChangeStore: ChangeStore {
 	private var db: OpaquePointer?
 	private var statements: [String: OpaquePointer] = [:]
@@ -58,6 +59,17 @@ public actor SQLiteChangeStore: ChangeStore {
 					covered INTEGER NOT NULL
 				)
 				""")
+			try Self.exec(opened, """
+				CREATE TABLE IF NOT EXISTS held (
+					id TEXT PRIMARY KEY,
+					created_at INTEGER NOT NULL,
+					kind INTEGER NOT NULL,
+					author TEXT NOT NULL,
+					h TEXT
+				)
+				""")
+			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_author ON held(author, kind)")
+			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_h ON held(h, kind)")
 		} catch {
 			sqlite3_close(opened)
 			throw error
@@ -263,6 +275,54 @@ public actor SQLiteChangeStore: ChangeStore {
 		}
 	}
 
+	// MARK: held relay events
+
+	public func recordHeld(_ events: [HeldEvent]) async throws {
+		if events.isEmpty { return }
+		try transaction {
+			let insert = try statement("INSERT OR IGNORE INTO held (id, created_at, kind, author, h) VALUES (?, ?, ?, ?, ?)")
+			for event in events {
+				try reset(insert)
+				try bind(insert, 1, event.id)
+				try bind(insert, 2, event.createdAt)
+				try bind(insert, 3, Int64(event.kind))
+				try bind(insert, 4, event.author)
+				if let hTag = event.hTag { try bind(insert, 5, hTag) }
+				try stepDone(insert)
+			}
+		}
+	}
+
+	public func heldEvents(matching filter: NostrFilter) async throws -> [HeldEvent] {
+		enum Argument { case text(String), integer(Int64) }
+		var clauses: [String] = []
+		var arguments: [Argument] = []
+		func list(_ column: String, _ values: [Argument]) {
+			clauses.append("\(column) IN (\(Array(repeating: "?", count: values.count).joined(separator: ",")))")
+			arguments += values
+		}
+		if let kinds = filter.kinds { list("kind", kinds.map { .integer(Int64($0)) }) }
+		if let authors = filter.authors { list("author", authors.map(Argument.text)) }
+		if let tags = filter.tagged["h"] { list("h", tags.map(Argument.text)) }
+		if let since = filter.since { clauses.append("created_at >= ?"); arguments.append(.integer(since)) }
+		if let until = filter.until { clauses.append("created_at <= ?"); arguments.append(.integer(until)) }
+		let select = try statement("SELECT id, created_at, kind, author, h FROM held" + (clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")))
+		try reset(select)
+		for (index, argument) in arguments.enumerated() {
+			switch argument {
+			case .text(let text): try bind(select, Int32(index + 1), text)
+			case .integer(let value): try bind(select, Int32(index + 1), value)
+			}
+		}
+		var events: [HeldEvent] = []
+		while try stepRow(select) {
+			let h = sqlite3_column_type(select, 4) == SQLITE_NULL ? nil : columnText(select, 4)
+			events.append(HeldEvent(id: columnText(select, 0), createdAt: sqlite3_column_int64(select, 1), kind: Int(sqlite3_column_int64(select, 2)), author: columnText(select, 3), hTag: h))
+		}
+		sqlite3_reset(select)
+		return events
+	}
+
 	// MARK: meta primitives
 
 	/// Host meta row (`MetaStore`): relay lists, wraps seen, join requests.
@@ -342,6 +402,11 @@ public actor SQLiteChangeStore: ChangeStore {
 
 	private func bind(_ statement: OpaquePointer, _ index: Int32, _ value: String) throws {
 		let rc = sqlite3_bind_text(statement, index, value, -1, sqliteTransient)
+		guard rc == SQLITE_OK else { throw error(rc) }
+	}
+
+	private func bind(_ statement: OpaquePointer, _ index: Int32, _ value: Int64) throws {
+		let rc = sqlite3_bind_int64(statement, index, value)
 		guard rc == SQLITE_OK else { throw error(rc) }
 	}
 

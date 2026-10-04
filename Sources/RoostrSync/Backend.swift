@@ -319,7 +319,7 @@ public actor Backend {
 		let plan = try await Engine.mutation(
 			action: action,
 			params: params,
-			objects: states.values.map { packCoreValueMaps($0.state) },
+			objects: Self.mutationObjects(states.values.map(\.state), params: params),
 			timestamp: Int64(Date().timeIntervalSince1970 * 1000),
 			author: author,
 			idSeed: UUID().uuidString.lowercased(),
@@ -350,6 +350,30 @@ public actor Backend {
 		}
 		if keyringChanged || touchedShared { scheduleRefreshShared() }
 		return unpackCoreValueMaps(plan.result)
+	}
+
+	/// The states a mutation plans over. The planner reads blocks only of the
+	/// objects its params name (targets, senders, recipients); every other
+	/// state goes without its blocks, which are most of a vault's bytes and
+	/// would overrun the core's per-request arena on a large one.
+	static func mutationObjects(_ states: [JSONValue], params: JSONValue) -> [JSONValue] {
+		var named: Set<String> = []
+		func collect(_ value: JSONValue) {
+			switch value {
+			case .string(let text): named.insert(text)
+			case .array(let items): items.forEach(collect)
+			case .object(let fields): fields.values.forEach(collect)
+			default: break
+			}
+		}
+		collect(params)
+		return states.map { state in
+			guard case .object(var fields) = state, let id = fields["id"]?.string, !named.contains(id), fields["blocks"] != nil else {
+				return packCoreValueMaps(state)
+			}
+			fields["blocks"] = .array([])
+			return packCoreValueMaps(.object(fields))
+		}
 	}
 
 	/// Creates a note and its first text block; returns the object id.
