@@ -4,7 +4,7 @@ import Glon
 public enum GlonError: Error, Equatable {
 	/// The linked engine speaks a different ABI than this wrapper.
 	case abiMismatch(UInt32)
-	/// Encoded request exceeds the engine's fixed 16 MiB request buffer.
+	/// Encoded request exceeds the engine's fixed 16 MiB request buffer (or the blob its 32 MiB one).
 	case requestTooLarge(Int)
 	/// The engine rejected the request (invalid JSON, unknown method, domain error).
 	case engine(String)
@@ -17,6 +17,8 @@ public enum GlonError: Error, Equatable {
 public actor GlonCore {
 	public static let abiVersion: UInt32 = 2
 	public static let requestLimit = 16 * 1024 * 1024
+	/// `abi.odin BLOB_LIMIT`: the binary side-channel of one request.
+	public static let blobLimit = 32 * 1024 * 1024
 	public static let shared = GlonCore()
 
 	private static let linkedABI: UInt32 = {
@@ -31,13 +33,24 @@ public actor GlonCore {
 
 	/// Executes `{method, payload}` and decodes the envelope's `result`.
 	public func call<Payload: Encodable, Result: Decodable>(_ method: String, _ payload: Payload) throws -> Result {
+		try call(method, payload, blob: nil)
+	}
+
+	/// Same, with `blob` in the request's binary side-channel (`core_reserve_blob`):
+	/// bytes the core reads without any JSON, e.g. a corpus of change protobufs.
+	public func call<Payload: Encodable, Result: Decodable>(_ method: String, _ payload: Payload, blob: Data?) throws -> Result {
 		guard Self.linkedABI == Self.abiVersion else { throw GlonError.abiMismatch(Self.linkedABI) }
 		let request = try encoder.encode(Envelope(method: method, payload: payload))
+		if let blob, blob.count > Self.blobLimit { throw GlonError.requestTooLarge(blob.count) }
 		guard request.count <= Self.requestLimit, let buffer = core_reserve(UInt32(request.count)) else {
 			throw GlonError.requestTooLarge(request.count)
 		}
 		defer { core_reset(0) }
 		request.withUnsafeBytes { buffer.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+		if let blob, !blob.isEmpty {
+			guard let target = core_reserve_blob(UInt32(blob.count)) else { throw GlonError.requestTooLarge(blob.count) }
+			blob.withUnsafeBytes { target.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+		}
 		guard core_execute() == 0, let pointer = core_response_pointer() else { throw GlonError.malformedResponse }
 		let response = Data(bytes: pointer, count: Int(core_response_length()))
 		let envelope: Response<Result>

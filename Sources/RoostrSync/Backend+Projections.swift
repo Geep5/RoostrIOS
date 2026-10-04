@@ -62,6 +62,15 @@ private final class QuerySignatures: @unchecked Sendable {
 			signatures = diff.next
 		}
 	}
+
+	/// The engine's cache no longer matches any snapshot (a refused reset
+	/// empties it, a refused batch may have half-landed): the next query resets.
+	func invalidate() {
+		lock.withLock {
+			owner = nil
+			signatures = [:]
+		}
+	}
 }
 
 private func fstr(_ fields: JSONValue?, _ key: String) -> String {
@@ -140,21 +149,54 @@ extension Backend {
 	}
 
 	/// `fetchQuery`: the engine's incremental query over the replayed states,
-	/// fed only what changed since the last call (`query.ts` cache protocol).
+	/// fed only what changed since the last call (`query.ts` cache protocol),
+	/// in batches under `queryPushBudget` like `query.ts pushAndQuery`: a whole
+	/// vault in one request costs the core's request arena many times its size.
 	public func query(body: JSONValue) async throws -> JSONValue {
 		try await ensure()
 		let owner = ObjectIdentifier(self)
 		let diff = QuerySignatures.shared.diff(owner: owner, states: states)
-		let result: JSONValue = try await Engine.call("query", [
-			"upserts": .array(diff.upserts),
-			"removed": .array(diff.removed.map(JSONValue.string)),
-			"reset": .bool(diff.reset),
-			"body": body,
-			"nowMs": .int(Int64(Date().timeIntervalSince1970 * 1000)),
-		])
+		let encoder = JSONEncoder()
+		var batches: [[JSONValue]] = []
+		var batch: [JSONValue] = []
+		var size = 0
+		for state in diff.upserts {
+			let bytes = try encoder.encode(state).count
+			if !batch.isEmpty && size + bytes > Self.queryPushBudget {
+				batches.append(batch)
+				batch = []
+				size = 0
+			}
+			batch.append(state)
+			size += bytes
+		}
+		batches.append(batch)
+		var result: JSONValue = .null
+		do {
+			for (index, part) in batches.enumerated() {
+				// Removals and the reset belong to the first call only, or a later
+				// batch would wipe the objects the earlier ones just loaded.
+				result = try await Engine.call("query", [
+					"upserts": .array(part),
+					"removed": .array(index == 0 ? diff.removed.map(JSONValue.string) : []),
+					"reset": .bool(index == 0 && diff.reset),
+					"body": body,
+					"nowMs": .int(Int64(Date().timeIntervalSince1970 * 1000)),
+				])
+			}
+		} catch {
+			QuerySignatures.shared.invalidate()
+			throw error
+		}
 		QuerySignatures.shared.commit(owner: owner, diff)
 		return result
 	}
+
+	/// State JSON per query request (`query.ts PUSH_BUDGET_BYTES` is 6 MiB in
+	/// WASM). Natively the core parses a request into its 128 MiB arena at
+	/// 64-bit node sizes: 6.3 MB of block-heavy notes overran it (a process
+	/// abort, not an error), 4.2 MB fit; 2 MiB keeps a wide margin.
+	static let queryPushBudget = 2 * 1024 * 1024
 
 	/// State fingerprint matching the desktop's GET /api/sync/digest: sha256
 	/// over `"<objectId>:<sorted change hex ids>\n"` lines, objects sorted,
