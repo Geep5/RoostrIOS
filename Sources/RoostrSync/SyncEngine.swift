@@ -121,8 +121,6 @@ public actor SyncEngine {
 	private var activeImports = 0
 	private var importedCount = 0
 	private var checkpointCount = 0
-	/// Publisher manifest cursors resolved this process, per scope ("" personal, else space tag).
-	private var floorCache: [String: Int64] = [:]
 	/// Mirror of the outbox's queued-not-in-flight count, for the status.
 	private var pendingCount = 0
 	private var queueRunning = false
@@ -168,8 +166,16 @@ public actor SyncEngine {
 		stopped = false
 		historyComplete = false
 		do {
+			// A device an earlier build walked from a kind-30079 manifest floor
+			// never held the older history: this also clears its bootstrapped
+			// flag, so it walks from zero once (docs/checkpoint-sync.md).
+			try await store.forgetCheckpointFloors()
 			cursor = try await store.cursor()
 			try await openSession()
+			if stopped {
+				await closeSession()
+				return
+			}
 			for pending in try await store.pendingPublishes() { try await offerToOutbox(pending) }
 		} catch {
 			emit(SyncStatus(phase: .error, imported: importedCount, pending: pendingCount, detail: "\(error)"))
@@ -187,10 +193,6 @@ public actor SyncEngine {
 		let bootstrapped = (try? await store.bootstrapped()) ?? false
 		let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
 		let since: Int64 = bootstrapped ? cursor + 1 : 1
-		// An unbootstrapped device subscribes live from the publisher's floor,
-		// not from zero: otherwise the live stream replays the whole vault the
-		// walk deliberately skipped (docs/checkpoint-sync.md).
-		if !bootstrapped { await resolveFloors() }
 		activeWalks += 1
 		walkTask = Task { await self.bootstrap(since: since, resumeUntil: floor, markBootstrapped: !bootstrapped) }
 		if stopped { return }
@@ -424,31 +426,25 @@ public actor SyncEngine {
 		let checkpoint = replayFaultGeneration
 		await persistCursor()
 
-		// A full walk pulls kind-1078 only from the publisher's manifest cursor
-		// on: everything older is folded into a kind-1079 checkpoint, which is
-		// walked unbounded. Resolved once per scope and remembered, so a later
-		// repair walk never widens back to event zero.
 		let full = since <= 1
 		// Checkpoints are walked to the end FIRST: every object renders from its
 		// cache within a few pages, then the change history streams in behind
 		// (docs/checkpoint-sync.md - a checkpoint never shortens the history).
 		// A reconciliation always covers a stream's whole set, so its filter
 		// takes the full walk's bounds whatever `since` an incremental walk uses.
-		let selfFloor = await checkpointFloor(scope: "", space: nil)
 		var checkpointStreams = [HistoryStream(
 			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind]),
 			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since)
 		)]
 		var changeStreams = [HistoryStream(
-			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: selfFloor > 0 ? selfFloor : nil),
-			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: full ? max(since, selfFloor) : since)
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind]),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)
 		)]
 		for space in spaces.values {
-			let floor = await checkpointFloor(scope: space.spaceTag, space: space)
 			let tagged = ["h": [space.spaceTag]]
 			changeStreams.append(HistoryStream(
-				reconcile: NostrFilter(kinds: [Engine.changeKind], since: floor > 0 ? floor : nil, tagged: tagged),
-				walk: NostrFilter(kinds: [Engine.changeKind], since: full ? max(since, floor) : since, tagged: tagged)
+				reconcile: NostrFilter(kinds: [Engine.changeKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.changeKind], since: since, tagged: tagged)
 			))
 			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
 			checkpointStreams.append(HistoryStream(
@@ -615,43 +611,6 @@ public actor SyncEngine {
 		}
 		try await importBatch(items, immediateNotify: true)
 		emitLiveStatus()
-	}
-
-	// ── Checkpoint manifest ──
-
-	/// Publisher's manifest cursor for a scope, resolved once per process and
-	/// persisted. No manifest → 0: that scope walks from genesis (today's behaviour).
-	private func checkpointFloor(scope: String, space: SharedSpace?) async -> Int64 {
-		if let cached = floorCache[scope] { return cached }
-		let floor = await fetchManifest(space) ?? 0
-		floorCache[scope] = floor
-		if floor > 0 { try? await store.setCheckpointFloor(scope: scope, floor) }
-		return floor
-	}
-
-	private func resolveFloors() async {
-		if let persisted = try? await store.checkpointFloors() { for (scope, floor) in persisted where floorCache[scope] == nil { floorCache[scope] = floor } }
-		_ = await checkpointFloor(scope: "", space: nil)
-		for space in spaces.values { _ = await checkpointFloor(scope: space.spaceTag, space: space) }
-	}
-
-	/// Newest kind-30079 manifest cursor for a scope. Personal: ours, self-sealed.
-	/// Shared: the space owner's, sealed under the space key.
-	private func fetchManifest(_ space: SharedSpace?) async -> Int64? {
-		let author = space?.info.owner ?? pk
-		let d = space.map { "\(Engine.manifestTag)/\($0.spaceTag)" } ?? Engine.manifestTag
-		let events = await query([NostrFilter(authors: [author], kinds: [Engine.manifestKind], tagged: ["d": [d]])], timeout: Self.queryTimeout)
-		let conversationKey: String
-		if let keyHex = space?.info.keyHex { conversationKey = keyHex }
-		else if let derived = try? await Engine.conversationKey(sharedX: try key.sharedX(with: pk)) { conversationKey = derived }
-		else { return nil }
-		for event in events.sorted(by: { $0.created_at > $1.created_at }) where NostrKey.verify(event) {
-			guard let plain = try? await Engine.decrypt(event.content, conversationKey: conversationKey),
-			      let parsed = try? JSONDecoder().decode(JSONValue.self, from: Data(plain.utf8)),
-			      let cursor = parsed["cursor"]?.int, cursor >= 0 else { continue }
-			return cursor
-		}
-		return nil
 	}
 
 	// ── Event → change / checkpoint ──
@@ -839,7 +798,7 @@ public actor SyncEngine {
 
 	private func subscribeLive() {
 		liveTask?.cancel()
-		let since = liveSince()
+		let since = cursor + 1
 		let tags = spaces.values.map(\.spaceTag)
 		liveTask = Task {
 			await withTaskGroup(of: Void.self) { group in
@@ -849,14 +808,6 @@ public actor SyncEngine {
 			}
 		}
 		liveUp = true
-	}
-
-	/// `max(cursor + 1, min floor of the covered scopes)`: nothing that can still
-	/// arrive live sits below a publisher's floor (every 1079 of a pass is newer).
-	private func liveSince() -> Int64 {
-		var floor: Int64? = floorCache[""]
-		for space in spaces.values { floor = min(floor ?? Int64.max, floorCache[space.spaceTag] ?? 0) }
-		return max(cursor + 1, floor ?? 0)
 	}
 
 	/// Personal changes and checkpoints, every installed space's stream (with
@@ -897,7 +848,7 @@ public actor SyncEngine {
 			if stopped || Task.isCancelled { return }
 			try? await Task.sleep(for: backoff)
 			backoff = min(backoff * 2, Self.liveBackoffCeiling)
-			since = liveSince()
+			since = cursor + 1
 			reconnecting = true
 		}
 	}

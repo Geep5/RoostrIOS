@@ -21,8 +21,8 @@ public enum LogoutError: Error, CustomStringConvertible, Equatable {
 /// Mirror of `query.ts`'s module state. The engine's query cache is
 /// process-global (one `GlonCore`), so the host-side signature snapshot that
 /// diffs against it is too; a different `Backend` instance is a different
-/// vault and forces `reset`. A signature is the change count plus the checkpoint
-/// hash: `ensure()` only replaces a state when one of them moved, and vanished ids leave `states`.
+/// vault and forces `reset`. A signature is the replay input's change digest plus
+/// the checkpoint hash: `ensure()` only replaces a state when one of them moved, and vanished ids leave `states`.
 private final class QuerySignatures: @unchecked Sendable {
 	static let shared = QuerySignatures()
 	private let lock = NSLock()
@@ -43,7 +43,7 @@ private final class QuerySignatures: @unchecked Sendable {
 			next.reserveCapacity(states.count)
 			var upserts: [JSONValue] = []
 			for (id, cached) in states {
-				let signature = "\(cached.changeCount):\(cached.checkpointHash)"
+				let signature = "\(cached.input.changeDigest):\(cached.input.checkpointHash)"
 				next[id] = signature
 				if reset || signatures[id] != signature { upserts.append(cached.state) }
 			}
@@ -192,6 +192,11 @@ extension Backend {
 		return result
 	}
 
+	/// The next `query` reloads every state into the engine (`rebuildLocalStates`).
+	nonisolated func forgetQuerySnapshot() {
+		QuerySignatures.shared.invalidate()
+	}
+
 	/// State JSON per query request (`query.ts PUSH_BUDGET_BYTES` is 6 MiB in
 	/// WASM). Natively the core parses a request into its 128 MiB arena at
 	/// 64-bit node sizes: 6.3 MB of block-heavy notes overran it (a process
@@ -226,7 +231,8 @@ extension Backend {
 	/// `backend.ts logout`: stops sync once no unpublished change would be
 	/// lost. Pending publishes are written as a JSON `[PendingPublish]` to
 	/// `exportTo` when given, otherwise their presence refuses the logout.
-	/// Forgetting the key and deleting the database is the host's job.
+	/// The persisted replays go with the session; forgetting the key and
+	/// deleting the database is the host's job.
 	public func logout(exportTo: URL?) async throws {
 		let pending = try await store.pendingPublishes()
 		if !pending.isEmpty {
@@ -234,5 +240,6 @@ extension Backend {
 			try JSONEncoder().encode(pending).write(to: exportTo, options: .atomic)
 		}
 		await stop()
+		try await clearReplayCache()
 	}
 }

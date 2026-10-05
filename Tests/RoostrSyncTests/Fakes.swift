@@ -205,7 +205,6 @@ actor InMemoryChangeStore: ChangeStore {
 	private var pendings: [String: PendingPublish] = [:]
 	private var published: Set<String> = []
 	private var checkpoints: [String: CheckpointRecord] = [:]
-	private var floors: [String: Int64] = [:]
 	private var held: [String: HeldEvent] = [:]
 
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int {
@@ -227,8 +226,7 @@ actor InMemoryChangeStore: ChangeStore {
 		checkpoints[record.objectId] = record
 		return true
 	}
-	func checkpointFloors() async throws -> [String: Int64] { floors }
-	func setCheckpointFloor(scope: String, _ floor: Int64) async throws { floors[scope] = floor }
+	func forgetCheckpointFloors() async throws {}
 
 	func cursor() async throws -> Int64 { cursorValue }
 	func setCursor(_ cursor: Int64, replayGroups: [(String, Int64)]) async throws {

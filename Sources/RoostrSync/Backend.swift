@@ -24,17 +24,25 @@ let vanishLogId = "__vanished__"
 
 public actor Backend {
 	struct Cached {
-		let changeCount: Int
-		/// Checkpoint hash the state was replayed on top of; "" for none. Replacing
-		/// 500 changes with one checkpoint must not read as "count unchanged".
-		let checkpointHash: String
+		/// The changes and checkpoint the state was replayed from: replacing
+		/// 500 changes with one checkpoint must not read as "unchanged".
+		let input: ReplayInput
 		let state: JSONValue
 	}
 
+	/// Persisted replays are valid only for the engine that computed them;
+	/// the suffix versions the host's row encoding.
+	static let replayCacheVersion = "\(GlonCore.sourceFingerprint)/1"
+	/// Replays written per store transaction.
+	static let replayWriteBatch = 64
+
 	/// Test hook: `"<changeCount>:<checkpointHash>"` the cached state was replayed under.
 	func cachedSignature(id: String) -> String? {
-		states[id].map { "\($0.changeCount):\($0.checkpointHash)" }
+		states[id].map { "\($0.input.changeCount):\($0.input.checkpointHash)" }
 	}
+
+	/// Test hook: `Engine.replay` runs by this instance; a warm start runs none.
+	private(set) var replayCount = 0
 
 	let key: NostrKey
 	let store: ChangeStore
@@ -46,6 +54,8 @@ public actor Backend {
 	public let hostMeta: MetaStore
 	/// Key-derived author id, parity with the Odin server (keys.ts authorIdFor).
 	public let author: String
+	/// Durable replay memo, when the store keeps one.
+	let replayCache: ReplayCacheStore?
 
 	var states: [String: Cached] = [:]
 	/// Object ids the synced ledger says are gone, rule-derived ones (objects
@@ -67,12 +77,21 @@ public actor Backend {
 	/// Actor reentrancy must not split a read/plan/commit claim transaction.
 	private var mutationTail: Task<Void, Never>?
 	private var rebuilding: Task<Void, Error>?
+	/// Fresh replays waiting for the memo, written behind `ensure()` by `replayWriter`.
+	private var replayWrites: [(id: String, input: ReplayInput, state: JSONValue)] = []
+	private var replayWriter: Task<Void, Never>?
+	/// Bumped when the memo is dropped: a scan that read it earlier must not apply its rows.
+	private var replayCacheEpoch = 0
+	private var stopped = false
+	/// `bootstrap_space_defaults`, queued once start has finished.
+	private var bootstrapTask: Task<Void, Never>?
 
 	public init(key: NostrKey, relays: [RelayClient], store: ChangeStore, keyring: SpaceKeyring = KeychainSpaceKeyring()) {
 		self.key = key
 		self.store = store
 		self.keyring = keyring
 		self.hostMeta = (store as? MetaStore) ?? InMemoryMetaStore()
+		self.replayCache = store as? ReplayCacheStore
 		self.engine = SyncEngine(key: key, relays: relays, store: store)
 		self.author = Self.authorId(secretHex: key.secretHex)
 	}
@@ -84,7 +103,13 @@ public actor Backend {
 
 	// ── Lifecycle ──
 
+	/// Brings sync up: shared-space reconcile, the engine's session, history
+	/// walk and live subscriptions. Readers need not wait for it - every read
+	/// goes through `ensure()`, which serves the local replica at once. A start
+	/// cancelled before it ran (the host tore the vault down) does nothing.
 	public func start() async {
+		if Task.isCancelled { return }
+		stopped = false
 		allDirty = true
 		forwardTask?.cancel()
 		wrapTask?.cancel()
@@ -110,15 +135,21 @@ public actor Backend {
 		// The session opens under the keyring's spaces; a second reconcile
 		// after start republishes whatever the relays still lack.
 		await refreshShared()
+		if stopped { return }
 		await engine.start()
+		if stopped { return }
+		scheduleRefreshShared()
 		// Converge the bundled catalog (new relations/types the engine added
 		// since this space was seeded) - same boot step as the native daemon;
-		// idempotent, so a converged space commits nothing.
-		_ = try? await mutate(action: "bootstrap_space_defaults", params: .object([:]))
-		scheduleRefreshShared()
+		// idempotent, so a converged space commits nothing. It plans over every
+		// state, so it runs behind start rather than on it.
+		bootstrapTask = Task { _ = try? await self.mutate(action: "bootstrap_space_defaults", params: .object([:])) }
 	}
 
 	public func stop() async {
+		stopped = true
+		bootstrapTask?.cancel()
+		bootstrapTask = nil
 		forwardTask?.cancel()
 		forwardTask = nil
 		wrapTask?.cancel()
@@ -137,8 +168,10 @@ public actor Backend {
 	}
 
 	public func awaitIdle() async {
+		await bootstrapTask?.value
 		await refreshChain?.value
 		await engine.awaitIdle()
+		await replayWriter?.value
 	}
 
 	public func statusUpdates() async -> AsyncStream<SyncStatus> {
@@ -170,7 +203,7 @@ public actor Backend {
 
 	// ── Replayed state ──
 
-	/// Recomputes dirty object states; an object whose change count did not grow keeps its cached replay.
+	/// Recomputes dirty object states; an object whose replay input did not change keeps its cached replay.
 	func ensure() async throws {
 		if let rebuilding { return try await rebuilding.value }
 		let work = Task {
@@ -181,34 +214,126 @@ public actor Backend {
 		try await work.value
 	}
 
+	/// Drops the persisted replays and every in-memory state, then replays
+	/// the whole replica from its stored changes and checkpoints; the engine's
+	/// query cache reloads from the result.
+	public func rebuildLocalStates() async throws {
+		try await clearReplayCache()
+		states.removeAll()
+		allDirty = true
+		try await ensure()
+		forgetQuerySnapshot()
+		notify(Array(states.keys))
+	}
+
+	/// Forgets the persisted replays: queued writes are dropped, the one in
+	/// flight lands first, and a scan that already read the rows discards them.
+	func clearReplayCache() async throws {
+		replayCacheEpoch += 1
+		replayWrites.removeAll()
+		await replayWriter?.value
+		try await replayCache?.clearCachedReplays()
+	}
+
 	private func rebuildStates() async throws {
 		var rebuilt = false
 		let ids: [String]
 		if allDirty {
 			allDirty = false
 			rebuilt = true
-			ids = try await store.objectIds()
 			dirty.removeAll()
+			ids = try await restoreCachedStates()
 		} else {
 			ids = Array(dirty)
 			dirty.removeAll()
 		}
+		var fresh: [(id: String, input: ReplayInput, state: JSONValue)] = []
 		for id in ids {
 			let changes = try await store.changesFor(objectId: id)
 			let checkpoint = try await store.checkpoint(objectId: id)
 			if changes.isEmpty && checkpoint == nil { states[id] = nil; continue }
-			let hash = checkpoint?.hash ?? ""
-			if let hit = states[id], hit.changeCount == changes.count, hit.checkpointHash == hash { continue }
+			let input = ReplayInput(changeIds: changes.map(\.id), checkpointHash: checkpoint?.hash ?? "")
+			if states[id]?.input == input { continue }
+			replayCount += 1
 			do {
 				if let state = try await Engine.replay(changes.map(\.json), checkpoint: checkpoint?.bytes) {
-					states[id] = Cached(changeCount: changes.count, checkpointHash: hash, state: state)
+					states[id] = Cached(input: input, state: state)
+					fresh.append((id, input, state))
 				}
 			} catch {
 				// One malformed legacy object must never brick the vault.
 				continue
 			}
 		}
+		persistReplays(fresh)
 		try await enforceVanished(rebuilt: rebuilt, touched: ids)
+	}
+
+	/// Full scan: takes every persisted replay whose input is exactly what the
+	/// store holds now under this engine; returns the ids that still need a replay.
+	private func restoreCachedStates() async throws -> [String] {
+		let ids = try await store.objectIds()
+		guard let replayCache else { return ids }
+		let epoch = replayCacheEpoch
+		let inputs = try await replayCache.replayInputs()
+		var misses: [String] = []
+		var wanted: [String] = []
+		for id in ids {
+			guard let input = inputs[id] else { misses.append(id); continue }
+			if states[id]?.input != input { wanted.append(id) }
+		}
+		let rows = try await replayCache.cachedReplays(objectIds: wanted, engineVersion: Self.replayCacheVersion)
+		let decoded = await Self.decodeReplays(rows.values.filter { $0.input == inputs[$0.objectId] })
+		guard epoch == replayCacheEpoch else { return ids }
+		for id in wanted {
+			if let state = decoded[id], let input = inputs[id] {
+				states[id] = Cached(input: input, state: state)
+			} else {
+				misses.append(id)
+			}
+		}
+		return misses
+	}
+
+	/// Off the actor: decoding a vault's states is the bulk of a warm start.
+	private nonisolated static func decodeReplays(_ rows: [CachedReplay]) async -> [String: JSONValue] {
+		let decoder = JSONDecoder()
+		var states: [String: JSONValue] = [:]
+		states.reserveCapacity(rows.count)
+		for row in rows {
+			if let state = try? decoder.decode(JSONValue.self, from: row.state) { states[row.objectId] = state }
+		}
+		return states
+	}
+
+	/// Queues fresh replays for the memo; never awaited by readers or imports.
+	private func persistReplays(_ fresh: [(id: String, input: ReplayInput, state: JSONValue)]) {
+		guard replayCache != nil, !fresh.isEmpty else { return }
+		replayWrites += fresh
+		if replayWriter == nil { replayWriter = Task(priority: .utility) { await self.drainReplayWrites() } }
+	}
+
+	private func drainReplayWrites() async {
+		defer { replayWriter = nil }
+		while !replayWrites.isEmpty, let replayCache {
+			let batch = Array(replayWrites.prefix(Self.replayWriteBatch))
+			replayWrites.removeFirst(batch.count)
+			let rows = await Self.encodeReplays(batch)
+			do {
+				try await replayCache.putCachedReplays(rows, engineVersion: Self.replayCacheVersion)
+			} catch {
+				// A memo that cannot be written only costs a replay next start.
+				replayWrites.removeAll()
+			}
+		}
+	}
+
+	/// Off the actor: encoding a vault's states is the bulk of a write.
+	private nonisolated static func encodeReplays(_ batch: [(id: String, input: ReplayInput, state: JSONValue)]) async -> [CachedReplay] {
+		let encoder = JSONEncoder()
+		return batch.compactMap { item in
+			(try? encoder.encode(item.state)).map { CachedReplay(objectId: item.id, input: item.input, state: $0) }
+		}
 	}
 
 	/// The ledger wins over whatever replayed: a relay copy of a vanished object

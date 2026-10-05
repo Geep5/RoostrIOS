@@ -14,11 +14,11 @@ SPA in a `WKWebView`, talking to the Swift backend over a message bridge.
 Vendor/Glon.xcframework   Odin engine: ios-arm64, ios-arm64-simulator, macos-arm64 static slices
 Vendor/glon-core.json     compiler + sha256 of every Odin source the framework was built from
 Sources/GlonCore/         GlonCore actor: single-flight JSON ABI over the static library
-Sources/RoostrSync/       Host for the engine: Contracts (shared types), Nostr keys/signing, Relay (NIP-01 + NIP-77 WebSocket; a 25 s ping keepalive fails a socket whose pong misses 10 s), Negentropy (set reconciliation protocol V1, byte-exact with hoytech/negentropy), SQLiteChangeStore (changes, one checkpoint per object, meta, held relay events), Identity (Keychain), SyncEngine (session + outbox loop; history by NIP-77 reconciliation of the events this device holds, checkpoints first, needed ids fetched in batches of 100, falling back to the paged kind-1078/1079 walk from the publisher's manifest floor when a relay answers NEG-ERR / NOTICE / nothing; personal, shared-space and gift-wrap subscriptions; docs/checkpoint-sync.md in glonOdin), Backend (objects/mutations the UI consumes), Backend+Spaces (keyring reconcile, NIP-59 invites and join requests, channels), SpaceKeyring (space keys in the Keychain, `app.roostr.space-keys`), GiftWrap (NIP-59 seal/wrap/unwrap, byte-compatible with nostr-tools), Backend+Projections (website-shaped lists/relations/query/digest), WebBridge (JS ⇄ Swift message bridge + roostr:// scheme handler)
+Sources/RoostrSync/       Host for the engine: Contracts (shared types), Nostr keys/signing, Relay (NIP-01 + NIP-77 WebSocket; a 25 s ping keepalive fails a socket whose pong misses 10 s), Negentropy (set reconciliation protocol V1, byte-exact with hoytech/negentropy), SQLiteChangeStore (changes, one checkpoint per object, meta, held relay events, replay cache), Identity (Keychain), SyncEngine (session + outbox loop; history by NIP-77 reconciliation of the events this device holds, checkpoints first, needed ids fetched in batches of 100, falling back to the paged kind-1078/1079 walk when a relay answers NEG-ERR / NOTICE / nothing; kind-30079 manifests are obsolete and never read, and a floor an older build stored is forgotten at start so that device walks from zero once; personal, shared-space and gift-wrap subscriptions; docs/checkpoint-sync.md in glonOdin), Backend (objects/mutations the UI consumes; replayed states restored from the replay cache), Backend+Spaces (keyring reconcile, NIP-59 invites and join requests, channels), SpaceKeyring (space keys in the Keychain, `app.roostr.space-keys`), GiftWrap (NIP-59 seal/wrap/unwrap, byte-compatible with nostr-tools), Backend+Projections (website-shaped lists/relations/query/digest), WebBridge (JS ⇄ Swift message bridge + roostr:// scheme handler)
 Sources/RoostrUI/         SwiftUI shell shared by both platforms: AppModel, identity gate, WebEditorView (the website in a WKWebView), RoostrApp scene
 Sources/RoostrMac/        macOS runner (`roostr-mac`) for the same UI without a simulator
 Tests/GlonCoreTests/      golden fixtures shared with glonOdin/core and the website: codec_fixtures.json (protobuf codec, content addressing), wire_fixtures.json (NIP-44, blinded tags, sealing, address verification), authority_fixtures.json (shared-space authority gate, vanish ledger); SyncSessionTests mirrors glonOdin/core/sync_session_test.odin (receive-side reassembly, cursor, replay bookkeeping; outbox order, dedupe, rotated-key rule, backoff, wake and sealing on first send) with events sealed by the engine itself
-Tests/RoostrSyncTests/    host tests: signing/verify against nostr-tools fixtures, store, relay, sync loop; NegentropyTests replays transcripts of the hoytech JS reference (Fixtures/negentropy_vectors.json) byte for byte; NegentropySyncTests (only missing ids fetched, completion waits for every one, NEG-ERR falls back to the walk); QueryCacheTests (a block-heavy vault queries and re-opens within the core's query cache: compact cached state, 2 MiB query batches, reset frees the old snapshot first); CheckpointSyncTests (supersede rule, checkpoint-seeded replay, cold start from a manifest floor, live checkpoint re-keying the replay memo); SharedSpacesTests drives owner/member/viewer backends through one in-memory relay (join request → invite wrap → key import → space backfill → authority gate → key rotation) and opens a nostr-tools gift wrap (Fixtures/nip59_fixture.json)
+Tests/RoostrSyncTests/    host tests: signing/verify against nostr-tools fixtures, store, relay, sync loop; NegentropyTests replays transcripts of the hoytech JS reference (Fixtures/negentropy_vectors.json) byte for byte; NegentropySyncTests (only missing ids fetched, completion waits for every one, NEG-ERR falls back to the walk); QueryCacheTests (a block-heavy vault queries and re-opens within the core's query cache: compact cached state, 2 MiB query batches, reset frees the old snapshot first); CheckpointSyncTests (supersede rule, checkpoint-seeded replay, cold start ignoring kind-30079 manifests and forgetting a legacy floor, live checkpoint re-keying the replay memo); ReplayCacheTests (a warm start serves fresh-replay-identical states without replaying; a new change, checkpoint or engine version invalidates a row; rebuild and logout clear it); SharedSpacesTests drives owner/member/viewer backends through one in-memory relay (join request → invite wrap → key import → space backfill → authority gate → key rotation) and opens a nostr-tools gift wrap (Fixtures/nip59_fixture.json)
 App/                      iOS entry (`RoostrIOSApp`), project generated by XcodeGen from project.yml; App/Web is the website build (folder reference, see below)
 ```
 
@@ -36,6 +36,11 @@ The shared ABI is version **2**. The Swift wrapper and generated artifact
 manifests must use the same version as `abi/abi.odin`; rebuild the framework
 when changing it. ABI v2 adds the optional `core_reserve_blob` side-channel;
 the Swift host continues to use JSON requests.
+
+After a rebuild, set `GlonCore.sourceFingerprint` to the new manifest's
+`sourceFingerprint` (`VendorFingerprintTests` fails until you do): the replay
+cache keys every persisted state on it, so states an older core replayed are
+never served.
 
 Call `core_init` once, then per call: `core_reserve(n)` → write UTF-8 JSON
 `{method, payload}` → `core_execute()` → read `core_response_pointer/length` →
@@ -70,6 +75,17 @@ suspension can be half-open and never fail), live subscriptions resume from
 the cursor at once, gift wraps are re-fetched and the engine outbox is woken
 (`outbox_wake`) so pending publishes skip their backoff. The status indicator
 shows `Reconnecting…` until a relay answers, then live.
+
+The editor opens as soon as the identity is read: `AppModel` constructs the
+`Backend` and runs `start()` (shared-space reconcile, session, history walk,
+live subscriptions, then `bootstrap_space_defaults`) behind it, while bridge
+reads serve the local replica at once and the page's sync status covers the
+catch-up. Replayed states persist in the store's `replay_cache` table, one row
+per object keyed on a digest of its change ids in replay order, its checkpoint
+hash and the engine fingerprint; a cold start replays only objects whose row
+no longer matches, and writes fresh rows in batches behind it.
+`Backend.rebuildLocalStates()` drops the cache and replays everything; logout
+clears it.
 
 ## Verify
 

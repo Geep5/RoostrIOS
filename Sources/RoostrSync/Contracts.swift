@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import GlonCore
 
@@ -154,9 +155,10 @@ public protocol ChangeStore: Sendable {
 	func checkpoint(objectId: String) async throws -> CheckpointRecord?
 	/// Keeps `record` when it beats the stored one: more covered wins, then the larger hash. Returns whether it was stored.
 	func putCheckpoint(_ record: CheckpointRecord) async throws -> Bool
-	/// Publisher manifest cursors per scope ("" personal, else the space tag): kind-1078 events older than the floor are folded into checkpoints.
-	func checkpointFloors() async throws -> [String: Int64]
-	func setCheckpointFloor(scope: String, _ floor: Int64) async throws
+	/// Drops the obsolete kind-30079 manifest floors an earlier build stored
+	/// and, when one shortened a walk, the bootstrapped flag with it: that
+	/// device never held the older history, so it walks from event zero once.
+	func forgetCheckpointFloors() async throws
 
 	func cursor() async throws -> Int64
 	/// Persists the cursor together with the engine's replay obligations, atomically.
@@ -179,6 +181,59 @@ public protocol ChangeStore: Sendable {
 	/// Held events matching `filter`'s `kinds`, `authors`, `#h`, `since` and
 	/// `until` (other fields are ignored): the local set of a reconciliation.
 	func heldEvents(matching filter: NostrFilter) async throws -> [HeldEvent]
+}
+
+/// Exactly what `Engine.replay` consumes for one object: its stored change
+/// ids in replay (insertion) order and the checkpoint it seeds from. A change
+/// id is the hash of its bytes, so equal inputs replay to equal states.
+public struct ReplayInput: Sendable, Equatable {
+	public let changeCount: Int
+	/// `ReplayInput.digest(changeIds:)` of the stored changes.
+	public let changeDigest: String
+	/// Checkpoint hash the state is replayed on top of; "" for none.
+	public let checkpointHash: String
+
+	public init(changeCount: Int, changeDigest: String, checkpointHash: String) {
+		self.changeCount = changeCount; self.changeDigest = changeDigest; self.checkpointHash = checkpointHash
+	}
+
+	public init(changeIds: [String], checkpointHash: String) {
+		self.init(changeCount: changeIds.count, changeDigest: Self.digest(changeIds: changeIds), checkpointHash: checkpointHash)
+	}
+
+	/// sha256 hex over each id followed by a newline, in replay order.
+	public static func digest<S: Sequence>(changeIds: S) -> String where S.Element == String {
+		var hasher = SHA256()
+		for id in changeIds {
+			hasher.update(data: Data(id.utf8))
+			hasher.update(data: Data([0x0a]))
+		}
+		return Hex.encode(Data(hasher.finalize()))
+	}
+}
+
+/// One persisted replay: the state JSON `Engine.replay` produced from `input`.
+public struct CachedReplay: Sendable, Equatable {
+	public let objectId: String
+	public let input: ReplayInput
+	public let state: Data
+
+	public init(objectId: String, input: ReplayInput, state: Data) {
+		self.objectId = objectId; self.input = input; self.state = state
+	}
+}
+
+/// Durable replay memo beside the changes: a cold start reuses a state only
+/// when its row was written from the same input under the same engine
+/// version, and replays everything else. A cache, never a source of truth.
+public protocol ReplayCacheStore: Sendable {
+	/// Every stored object's current replay input, read without decoding change JSON.
+	func replayInputs() async throws -> [String: ReplayInput]
+	/// The rows of `objectIds` written under `engineVersion`, by object id.
+	func cachedReplays(objectIds: [String], engineVersion: String) async throws -> [String: CachedReplay]
+	/// Upserts `rows` in one transaction.
+	func putCachedReplays(_ rows: [CachedReplay], engineVersion: String) async throws
+	func clearCachedReplays() async throws
 }
 
 public enum SyncPhase: String, Sendable {

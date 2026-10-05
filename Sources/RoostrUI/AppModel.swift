@@ -24,6 +24,8 @@ public final class AppModel: WebBridgeHost {
 	private let keyring: SpaceKeyring
 	private let databasePath: String
 	private var store: SQLiteChangeStore?
+	/// The backend's `start()`, running behind the open editor.
+	private var starting: Task<Void, Never>?
 	private let reminders = Reminders()
 	private let pathMonitor = NWPathMonitor()
 	/// Interfaces of the last satisfied network path; nil while offline or before the first update.
@@ -64,7 +66,8 @@ public final class AppModel: WebBridgeHost {
 		return AppModel(identity: identity, keyring: keyring, databasePath: database)
 	}
 
-	/// Loads the stored identity and, when present, brings the backend up.
+	/// Loads the stored identity and, when present, opens the vault: `loaded`
+	/// turns true as soon as the backend exists, while sync starts behind it.
 	public func start() async {
 		defer { loaded = true }
 		do {
@@ -152,6 +155,9 @@ public final class AppModel: WebBridgeHost {
 		try await login(newKey)
 	}
 
+	/// Opens the replica under `newKey` and starts sync without waiting for
+	/// it: every backend read serves the local replica at once, and the web
+	/// UI's sync status covers the catch-up.
 	private func login(_ newKey: NostrKey) async throws {
 		await teardown()
 		key = newKey
@@ -163,12 +169,14 @@ public final class AppModel: WebBridgeHost {
 		let backend = Backend(key: newKey, relays: relays, store: store, keyring: keyring)
 		self.store = store
 		self.backend = backend
-		await backend.start()
 		reminders.follow(backend)
+		starting = Task { await backend.start() }
 	}
 
 	private func teardown() async {
 		reminders.stop()
+		starting?.cancel()
+		starting = nil
 		if let backend { await backend.stop() }
 		if let store { await store.close() }
 		backend = nil

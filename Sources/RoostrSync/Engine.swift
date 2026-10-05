@@ -135,9 +135,6 @@ public enum Engine {
 	public static let changeKind = 1078
 	/// One sealed Checkpoint protobuf per object (docs/checkpoint-sync.md).
 	public static let checkpointKind = 1079
-	/// Replaceable manifest the publisher stamps once every object is covered.
-	public static let manifestKind = 30079
-	public static let manifestTag = "roostr-checkpoint"
 	/// NIP-09 deletion; with `["h", spaceTag]` the space's stream (relay rule, space-vanish contract §4).
 	public static let deletionKind = 5
 

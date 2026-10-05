@@ -5,10 +5,10 @@ import XCTest
 
 /// Checkpoint sync on the native host (docs/checkpoint-sync.md): the store
 /// keeps one checkpoint per object under the supersede rule, a cold start
-/// imports kind-1079 payloads and walks kind-1078 only from the publisher's
-/// manifest floor, and replay seeds from the checkpoint. The phone never
-/// builds checkpoints, so a publisher's payload is hand-assembled here from
-/// the wire layout in core/proto.odin, as the browser test does.
+/// imports kind-1079 payloads and the whole kind-1078 history (kind-30079
+/// manifests are obsolete and never read), and replay seeds from the
+/// checkpoint. The phone never builds checkpoints, so a publisher's payload is
+/// hand-assembled here from the wire layout in core/proto.odin, as the browser test does.
 final class CheckpointSyncTests: XCTestCase {
 	private let key = NostrKey.generate()
 
@@ -77,10 +77,28 @@ final class CheckpointSyncTests: XCTestCase {
 		_ = try await store.addChanges([ChangeRecord(id: "c1", objectId: "other", bytes: Data(), json: .object([:]))])
 		let ids = try await store.objectIds()
 		XCTAssertEqual(ids.sorted(), ["doc", "other"], "an object held only as a checkpoint is queryable")
-		try await store.setCheckpointFloor(scope: "", 500)
-		try await store.setCheckpointFloor(scope: "tag", 700)
-		let floors = try await store.checkpointFloors()
-		XCTAssertEqual(floors, ["": 500, "tag": 700])
+	}
+
+	func testForgettingLegacyFloorsDropsBootstrappedOnlyWhenOneShortenedAWalk() async throws {
+		let store = try SQLiteChangeStore.inMemory()
+		try await store.setBootstrapped()
+		try await store.forgetCheckpointFloors()
+		var bootstrapped = try await store.bootstrapped()
+		XCTAssertTrue(bootstrapped, "no floor record: nothing to forget")
+
+		try await store.setMeta("checkpoint-floors", #"{"":0}"#)
+		try await store.forgetCheckpointFloors()
+		bootstrapped = try await store.bootstrapped()
+		XCTAssertTrue(bootstrapped, "a zero floor never shortened a walk")
+		var floors = try await store.meta("checkpoint-floors")
+		XCTAssertNil(floors)
+
+		try await store.setMeta("checkpoint-floors", #"{"":500,"tag":700}"#)
+		try await store.forgetCheckpointFloors()
+		bootstrapped = try await store.bootstrapped()
+		XCTAssertFalse(bootstrapped, "a walk from a manifest floor never held the older history")
+		floors = try await store.meta("checkpoint-floors")
+		XCTAssertNil(floors)
 	}
 
 	// ── Replay ──
@@ -101,42 +119,44 @@ final class CheckpointSyncTests: XCTestCase {
 
 	// ── Cold start ──
 
-	func testColdStartImportsCheckpointAndReconcilesChangesFromManifestFloor() async throws {
+	func testColdStartIgnoresManifestsAndWalksTheWholeHistory() async throws {
 		let relay = FakeRelay()
 		let create = try await change("doc", ops: [.object(["objectCreate": .object(["typeKey": .string("note")])]), setName("v1")])
 		let edit = try await change("doc", ops: [setName("v2")], parents: [create.id])
-		// The publisher: the covered change is OLD (before the floor) and the
-		// tail is NEW; the checkpoint folds the old one in.
+		// An older publisher: a checkpoint folding in the old change and a
+		// kind-30079 manifest claiming everything before it is covered.
 		let c1 = Self.checkpointBytes(objectId: "doc", typeKey: "note", fields: [("name", "v1")], heads: [create.id], covered: [create.id], createdAt: 1)
 		let oldChange = try await sealed(kind: Engine.changeKind, create.bytes.base64EncodedString(), createdAt: 100, tags: [["h", try await Engine.blind(secretHex: key.secretHex, id: "doc")]])
 		let checkpoint = try await sealed(kind: Engine.checkpointKind, c1.base64EncodedString(), createdAt: 150, tags: [["h", try await Engine.blind(secretHex: key.secretHex, id: "doc")]])
-		let manifest = try await sealed(kind: Engine.manifestKind, #"{"cursor":150,"objects":1}"#, createdAt: 160, tags: [["d", Engine.manifestTag]])
+		let manifest = try await sealed(kind: 30079, #"{"cursor":150,"objects":1}"#, createdAt: 160, tags: [["d", "roostr-checkpoint"]])
 		let newChange = try await sealed(kind: Engine.changeKind, edit.bytes.base64EncodedString(), createdAt: 200, tags: [["h", try await Engine.blind(secretHex: key.secretHex, id: "doc")]])
 		for event in [oldChange, checkpoint, manifest, newChange] { try await relay.publish(event, timeout: .seconds(1)) }
 
+		// An earlier build walked this device from that manifest's floor.
 		let store = try SQLiteChangeStore.inMemory()
+		try await store.setMeta("checkpoint-floors", #"{"":150}"#)
+		try await store.setBootstrapped()
 		let backend = Backend(key: key, relays: [relay], store: store)
 		await backend.start()
 		await backend.awaitIdle()
 
+		let touched = relay.queryFilters + relay.subscribeFilters + relay.reconcileFilters
+		XCTAssertFalse(touched.contains { $0.kinds?.contains(30079) == true }, "no kind-30079 manifest is ever requested")
 		let held = try await store.checkpoint(objectId: "doc")
 		XCTAssertEqual(held?.covered, 1)
-		XCTAssertEqual(held?.heads, [create.id])
 		let changes = try await store.changesFor(objectId: "doc")
-		XCTAssertEqual(changes.map(\.id), [edit.id], "only the tail past the floor is stored; the covered change is not")
+		XCTAssertEqual(Set(changes.map(\.id)), [create.id, edit.id], "the covered change is history too: a checkpoint never shortens it")
 		let reconciled = relay.reconcileFilters.filter { $0.kinds == [Engine.changeKind] && $0.authors != nil }
 		XCTAssertFalse(reconciled.isEmpty)
-		XCTAssertTrue(reconciled.allSatisfy { $0.since == 150 }, "kind-1078 is reconciled from the manifest cursor, not genesis: \(reconciled.map(\.since))")
-		XCTAssertTrue(relay.reconcileFilters.contains { $0.kinds == [Engine.checkpointKind] && $0.since == nil }, "kind-1079 is reconciled unbounded")
-		XCTAssertFalse(relay.fetchedIds.contains(oldChange.id), "the covered change is never fetched")
-		let live = try XCTUnwrap(relay.subscribeFilters.first { $0.authors != nil })
-		XCTAssertEqual(live.kinds, [Engine.changeKind, Engine.checkpointKind])
-		XCTAssertGreaterThanOrEqual(live.since ?? 0, 150, "live never reaches below a publisher's floor")
+		XCTAssertTrue(reconciled.allSatisfy { $0.since == nil }, "kind-1078 is reconciled from genesis: \(reconciled.map(\.since))")
+		XCTAssertTrue(relay.fetchedIds.contains(oldChange.id), "the legacy floor is forgotten: the old change is fetched")
+		let floors = try await store.meta("checkpoint-floors")
+		XCTAssertNil(floors)
+		let bootstrapped = try await store.bootstrapped()
+		XCTAssertTrue(bootstrapped, "the full walk completed")
 
 		let object = try await backend.object(id: "doc")
-		XCTAssertEqual(object["fields"]?["name"]?["stringValue"]?.string, "v2", "state = checkpoint + tail")
-		let floors = try await store.checkpointFloors()
-		XCTAssertEqual(floors[""], 150)
+		XCTAssertEqual(object["fields"]?["name"]?["stringValue"]?.string, "v2")
 		await backend.stop()
 	}
 

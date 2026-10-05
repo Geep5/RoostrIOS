@@ -16,6 +16,10 @@ public enum GlonError: Error, Equatable {
 /// process; the engine's query cache is process-global state behind this actor.
 public actor GlonCore {
 	public static let abiVersion: UInt32 = 2
+	/// `sourceFingerprint` of Vendor/glon-core.json: the Odin sources the
+	/// linked framework was built from. Persisted engine output (the replay
+	/// cache) is keyed on it; `VendorFingerprintTests` keeps it in step with the vendored framework.
+	public static let sourceFingerprint = "b1805c1fc2bf0e4c69d44c97f935df728f4c51a025b9803a16d8d5cb07b655b0"
 	public static let requestLimit = 16 * 1024 * 1024
 	/// `abi.odin BLOB_LIMIT`: the binary side-channel of one request.
 	public static let blobLimit = 32 * 1024 * 1024

@@ -19,8 +19,8 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 /// `ChangeStore` over the system SQLite. Three tables mirror the browser's
 /// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order),
 /// `checkpoints` (one per object) and `meta` (string key/value); `held` lists
-/// the relay events this device holds, for NIP-77. Statements are prepared
-/// once and reused.
+/// the relay events this device holds, for NIP-77; `replay_cache` memoizes
+/// replayed states (`ReplayCacheStore`). Statements are prepared once and reused.
 public actor SQLiteChangeStore: ChangeStore {
 	private var db: OpaquePointer?
 	private var statements: [String: OpaquePointer] = [:]
@@ -70,6 +70,16 @@ public actor SQLiteChangeStore: ChangeStore {
 				""")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_author ON held(author, kind)")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_h ON held(h, kind)")
+			try Self.exec(opened, """
+				CREATE TABLE IF NOT EXISTS replay_cache (
+					object_id TEXT PRIMARY KEY,
+					engine_version TEXT NOT NULL,
+					change_count INTEGER NOT NULL,
+					change_digest TEXT NOT NULL,
+					checkpoint_hash TEXT NOT NULL,
+					state BLOB NOT NULL
+				)
+				""")
 		} catch {
 			sqlite3_close(opened)
 			throw error
@@ -183,15 +193,13 @@ public actor SQLiteChangeStore: ChangeStore {
 		return (Int(sqlite3_column_int64(select, 0)), columnText(select, 1))
 	}
 
-	public func checkpointFloors() async throws -> [String: Int64] {
-		guard let raw = try meta("checkpoint-floors") else { return [:] }
-		return try decoder.decode([String: Int64].self, from: Data(raw.utf8))
-	}
-
-	public func setCheckpointFloor(scope: String, _ floor: Int64) async throws {
-		var floors = try await checkpointFloors()
-		floors[scope] = floor
-		try setMeta("checkpoint-floors", String(decoding: try encoder.encode(floors), as: UTF8.self))
+	public func forgetCheckpointFloors() async throws {
+		guard let raw = try meta("checkpoint-floors") else { return }
+		let floors = (try? decoder.decode([String: Int64].self, from: Data(raw.utf8))) ?? [:]
+		try transaction {
+			try deleteMeta("checkpoint-floors")
+			if floors.values.contains(where: { $0 > 0 }) { try deleteMeta("bootstrapped") }
+		}
 	}
 
 	// MARK: meta
@@ -323,6 +331,78 @@ public actor SQLiteChangeStore: ChangeStore {
 		return events
 	}
 
+	// MARK: replay cache
+
+	public func replayInputs() async throws -> [String: ReplayInput] {
+		var inputs: [String: ReplayInput] = [:]
+		let checkpoints = try statement("SELECT object_id, hash FROM checkpoints")
+		try reset(checkpoints)
+		var hashes: [String: String] = [:]
+		while try stepRow(checkpoints) { hashes[columnText(checkpoints, 0)] = columnText(checkpoints, 1) }
+		sqlite3_reset(checkpoints)
+		// The (object_id, seq) index yields each object's ids contiguously, in replay order.
+		let select = try statement("SELECT object_id, id FROM changes INDEXED BY changes_object_id ORDER BY object_id, seq")
+		try reset(select)
+		var current: String?
+		var ids: [String] = []
+		func flush() {
+			guard let current else { return }
+			inputs[current] = ReplayInput(changeIds: ids, checkpointHash: hashes[current] ?? "")
+		}
+		while try stepRow(select) {
+			let objectId = columnText(select, 0)
+			if objectId != current {
+				flush()
+				current = objectId
+				ids.removeAll(keepingCapacity: true)
+			}
+			ids.append(columnText(select, 1))
+		}
+		flush()
+		sqlite3_reset(select)
+		for (objectId, hash) in hashes where inputs[objectId] == nil {
+			inputs[objectId] = ReplayInput(changeIds: [], checkpointHash: hash)
+		}
+		return inputs
+	}
+
+	public func cachedReplays(objectIds: [String], engineVersion: String) async throws -> [String: CachedReplay] {
+		let select = try statement("SELECT change_count, change_digest, checkpoint_hash, state FROM replay_cache WHERE object_id = ? AND engine_version = ?")
+		var rows: [String: CachedReplay] = [:]
+		for objectId in objectIds {
+			try reset(select)
+			try bind(select, 1, objectId)
+			try bind(select, 2, engineVersion)
+			if try stepRow(select) {
+				let input = ReplayInput(changeCount: Int(sqlite3_column_int64(select, 0)), changeDigest: columnText(select, 1), checkpointHash: columnText(select, 2))
+				rows[objectId] = CachedReplay(objectId: objectId, input: input, state: columnBlob(select, 3))
+			}
+		}
+		sqlite3_reset(select)
+		return rows
+	}
+
+	public func putCachedReplays(_ rows: [CachedReplay], engineVersion: String) async throws {
+		if rows.isEmpty { return }
+		try transaction {
+			let upsert = try statement("INSERT OR REPLACE INTO replay_cache (object_id, engine_version, change_count, change_digest, checkpoint_hash, state) VALUES (?, ?, ?, ?, ?, ?)")
+			for row in rows {
+				try reset(upsert)
+				try bind(upsert, 1, row.objectId)
+				try bind(upsert, 2, engineVersion)
+				try bind(upsert, 3, Int64(row.input.changeCount))
+				try bind(upsert, 4, row.input.changeDigest)
+				try bind(upsert, 5, row.input.checkpointHash)
+				try bind(upsert, 6, row.state)
+				try stepDone(upsert)
+			}
+		}
+	}
+
+	public func clearCachedReplays() async throws {
+		try Self.exec(try handle(), "DELETE FROM replay_cache")
+	}
+
 	// MARK: meta primitives
 
 	/// Host meta row (`MetaStore`): relay lists, wraps seen, join requests.
@@ -442,4 +522,4 @@ public actor SQLiteChangeStore: ChangeStore {
 	}
 }
 
-extension SQLiteChangeStore: MetaStore {}
+extension SQLiteChangeStore: MetaStore, ReplayCacheStore {}
