@@ -1,0 +1,1 @@
+import{_ as e,g as t}from"./DPgzet-E.js";var n={page:`📄`,note:`📝`,task:`✅`,person:`👤`,project:`🔨`,bookmark:`🔖`,query:`🔍`,set:`🔍`,collection:`🗂️`,peer:`◉`,agent:`🤖`,channel:`◍`,chat:`💬`,credential:`🔑`};function r(r){let i=t.types.filter(e=>e.key===r&&e.icon);return(i.find(t=>t.space===e.id)??i[0])?.icon||n[r]||``}function i(e,t){return e||r(t)||`•`}export{i as n,r,n as t};
