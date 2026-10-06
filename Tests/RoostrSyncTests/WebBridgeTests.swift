@@ -102,4 +102,83 @@ final class WebBridgeTests: XCTestCase {
 		XCTAssertEqual((failure["payload"] as? [String: Any])?["message"] as? String, "unknown bridge method nope")
 		bridge.detach()
 	}
+
+	/// Pull-to-refresh end to end: a page subscribed through "start" asks for
+	/// "syncNow"; the resume reconciles an event the live subscription could
+	/// never deliver (created_at before the cursor), its object id reaches the
+	/// page as a "commit" event and "fetchObject" serves the new state.
+	func testSyncNowDeliversReconciledCommitToPage() async throws {
+		let key = try XCTUnwrap(Host().key)
+		func seed(_ relay: FakeRelay) async throws -> String {
+			let backend = Backend(key: key, relays: [relay], store: InMemoryChangeStore())
+			await backend.start()
+			let id = try await backend.createNote(name: "From laptop", text: "late")
+			await backend.awaitIdle()
+			await backend.stop()
+			return id
+		}
+		let laptop = FakeRelay()
+		let laptopId = try await seed(laptop)
+		try await Task.sleep(for: .milliseconds(1_100))
+		let relay = FakeRelay()
+		_ = try await seed(relay)
+		// A restart on the bootstrapped store subscribes live from the cursor.
+		let store = InMemoryChangeStore()
+		let earlier = Backend(key: key, relays: [relay], store: store)
+		await earlier.start()
+		await earlier.awaitIdle()
+		await earlier.stop()
+		let backend = Backend(key: key, relays: [relay], store: store)
+		await backend.start()
+		await backend.awaitIdle()
+
+		let page = """
+		<!doctype html><html><head><title>Roostr refresh shell</title></head><body>
+		<script>
+		window.__replies = {};
+		window.__commits = [];
+		window.__roostrReply = (id, ok, payload) => { window.__replies[id] = { ok, payload }; };
+		window.__roostrEvent = (name, payload) => { if (name === "commit") window.__commits.push(...payload); };
+		window.__call = (id, method, args) => window.webkit.messageHandlers.roostr.postMessage({ id, method, args });
+		window.__call(1, "start", []);
+		</script></body></html>
+		"""
+		try page.write(to: bundle.appendingPathComponent("200.html"), atomically: true, encoding: .utf8)
+		let host = Host()
+		host.key = key
+		host.backend = backend
+		let bridge = WebBridge(host: host)
+		let navigation = Navigation()
+		let webView = bridge.makeWebView(bundleURL: bundle)
+		webView.navigationDelegate = navigation
+		await withCheckedContinuation { continuation in navigation.finished = continuation }
+		let startReply = await eventually(webView, "window.__replies[1] || null")
+		let started = try XCTUnwrap(startReply as? [String: Any])
+		XCTAssertEqual(started["ok"] as? Bool, true)
+		// "start" reconnects behind the reload; let that pass finish first.
+		await backend.resume()
+
+		// The offline laptop comes back: the relay accepts its older events, no live delivery.
+		for event in laptop.stored { try await relay.publish(event, timeout: .seconds(1)) }
+		try await Task.sleep(for: .milliseconds(200))
+		let early = await evaluate(webView, "window.__commits.includes(\(String(reflecting: laptopId)))")
+		XCTAssertEqual(early as? Bool, false)
+
+		_ = await evaluate(webView, "window.__call(2, \"syncNow\", []); null")
+		let syncReply = await eventually(webView, "window.__replies[2] || null")
+		let synced = try XCTUnwrap(syncReply as? [String: Any])
+		XCTAssertEqual(synced["ok"] as? Bool, true)
+		XCTAssertEqual((synced["payload"] as? [String: Any])?["phase"] as? String, "live")
+		let committed = await eventually(webView, "window.__commits.includes(\(String(reflecting: laptopId))) || null")
+		XCTAssertEqual(committed as? Bool, true, "the reconciled object's commit reaches the page")
+
+		_ = await evaluate(webView, "window.__call(3, \"fetchObject\", [\(String(reflecting: laptopId))]); null")
+		let fetchReply = await eventually(webView, "window.__replies[3] || null")
+		let fetched = try XCTUnwrap(fetchReply as? [String: Any])
+		XCTAssertEqual(fetched["ok"] as? Bool, true)
+		let object = try XCTUnwrap(fetched["payload"] as? [String: Any])
+		XCTAssertEqual(object["id"] as? String, laptopId)
+		bridge.detach()
+		await backend.stop()
+	}
 }

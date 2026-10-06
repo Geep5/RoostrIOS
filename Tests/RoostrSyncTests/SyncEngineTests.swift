@@ -193,6 +193,104 @@ final class SyncEngineTests: XCTestCase {
 		try await assertRecovered(s, within: .seconds(3.5))
 		await s.phone.stop()
 	}
+
+	/// Events a cursor-based resubscribe can never deliver: created_at at or
+	/// before the phone's cursor (a device that was offline publishing late, a
+	/// skewed clock, the same second). Only a reconciliation finds them.
+	func testResumeReconcilesEventsAtOrBeforeCursor() async throws {
+		let laptop = FakeRelay()
+		let laptopId = try await seed(laptop)
+		try await Task.sleep(for: .milliseconds(1_100))
+		let relay = FakeRelay()
+		_ = try await seed(relay)
+
+		// A restart on the bootstrapped store subscribes live from the cursor.
+		let store = InMemoryChangeStore()
+		let earlier = Backend(key: key, relays: [relay], store: store)
+		await earlier.start()
+		await earlier.awaitIdle()
+		await earlier.stop()
+		let phone = Backend(key: key, relays: [relay], store: store)
+		await phone.start()
+		await phone.awaitIdle()
+		let commits = CommitLog(await phone.commitUpdates())
+		let statuses = StatusLog(await phone.statusUpdates())
+		let cursor = try XCTUnwrap(relay.stored.map(\.created_at).max())
+		XCTAssertTrue(laptop.stored.allSatisfy { $0.created_at < cursor })
+
+		// The offline laptop comes back: the relay accepts its older events.
+		for event in laptop.stored { try await relay.publish(event, timeout: .seconds(1)) }
+		try await Task.sleep(for: .milliseconds(200))
+		let early = try await phone.objects().contains { $0.id == laptopId }
+		XCTAssertFalse(early, "the live subscription starts after the cursor")
+
+		await phone.resume()
+		let caughtUp = try await phone.objects().contains { $0.id == laptopId }
+		XCTAssertTrue(caughtUp, "resume reconciles and imports what the cursor skipped")
+		_ = try await eventually { commits.ids.contains(laptopId) ? true : nil }
+		XCTAssertEqual(statuses.last?.phase, .live)
+		let seen = statuses.all
+		let catching = try XCTUnwrap(seen.firstIndex { $0.phase == .backfill && $0.detail == "Catching up…" }, "\(seen)")
+		XCTAssertTrue(seen[catching...].contains { $0.phase == .live }, "\(seen)")
+		await phone.stop()
+	}
+
+	/// Two relays; the laptop reaches only the first, whose socket went
+	/// half-open. Its event is lost to the live link, then a newer one on the
+	/// second relay moves the cursor past it, so resubscribing from the cursor skips it.
+	private struct SilentDeathScenario {
+		let link: StallingRelay
+		let phone: Backend
+		let lostId: String
+	}
+
+	/// Seeds run first: each one's engine retires the session of any engine started before it.
+	private func silentDeathScenario() async throws -> SilentDeathScenario {
+		let history = FakeRelay()
+		_ = try await seed(history)
+		try await Task.sleep(for: .milliseconds(1_100))
+		let lost = FakeRelay()
+		let lostId = try await seed(lost)
+		try await Task.sleep(for: .milliseconds(1_100))
+		let newer = FakeRelay()
+		let newerId = try await seed(newer)
+		XCTAssertTrue(newer.stored.map(\.created_at).min()! > lost.stored.map(\.created_at).max()!)
+
+		let first = FakeRelay(url: URL(string: "ws://first.relay")!)
+		let second = FakeRelay(url: URL(string: "ws://second.relay")!)
+		for event in history.stored {
+			try await first.publish(event, timeout: .seconds(1))
+			try await second.publish(event, timeout: .seconds(1))
+		}
+		let link = StallingRelay(first)
+		let phone = Backend(key: key, relays: [link, second], store: InMemoryChangeStore())
+		await phone.start()
+		await phone.awaitIdle()
+
+		link.stall()
+		for event in lost.stored { try await first.publish(event, timeout: .seconds(1)) }
+		for event in newer.stored { try await second.publish(event, timeout: .seconds(1)) }
+		_ = try await eventually { try await phone.objects().contains { $0.id == newerId } ? true : nil }
+		let early = try await phone.objects().contains { $0.id == lostId }
+		XCTAssertFalse(early, "the half-open link delivered nothing")
+		return SilentDeathScenario(link: link, phone: phone, lostId: lostId)
+	}
+
+	func testResumeRecoversEventsLostToHalfOpenSocket() async throws {
+		let s = try await silentDeathScenario()
+		await s.phone.resume()
+		let caughtUp = try await s.phone.objects().contains { $0.id == s.lostId }
+		XCTAssertTrue(caughtUp, "resume reconciles the stalled relay")
+		await s.phone.stop()
+	}
+
+	func testDroppedSocketReconnectReconciles() async throws {
+		let s = try await silentDeathScenario()
+		// The keepalive finally fails the half-open socket; the live loop redials on its own.
+		await s.link.disconnect()
+		_ = try await eventually(timeout: .seconds(5)) { try await s.phone.objects().contains { $0.id == s.lostId } ? true : nil }
+		await s.phone.stop()
+	}
 }
 
 /// Every status a stream yields, readable from the test.
@@ -211,4 +309,21 @@ private final class StatusLog: @unchecked Sendable {
 
 	var all: [SyncStatus] { lock.withLock { seen } }
 	var last: SyncStatus? { lock.withLock { seen.last } }
+}
+
+/// Every object id a commit stream yields, readable from the test.
+private final class CommitLog: @unchecked Sendable {
+	private let lock = NSLock()
+	private var seen: Set<String> = []
+	private var task: Task<Void, Never>?
+
+	init(_ stream: AsyncStream<[String]>) {
+		task = Task { [weak self] in
+			for await ids in stream { self?.lock.withLock { self?.seen.formUnion(ids) } }
+		}
+	}
+
+	deinit { task?.cancel() }
+
+	var ids: Set<String> { lock.withLock { seen } }
 }

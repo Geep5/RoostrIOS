@@ -130,6 +130,11 @@ public actor SyncEngine {
 	private var liveTask: Task<Void, Never>?
 	private var outboxTask: Task<Void, Never>?
 	private var resumeTask: Task<Void, Never>?
+	/// The last catch-up pass requested; `catchUpQueued` while it waits for its predecessor.
+	private var catchUpTail: Task<Void, Never>?
+	private var catchUpQueued = false
+	/// Catch-up passes running: the status says catching up, not live, until they finish.
+	private var catchingUp = 0
 	private var importChain: Task<Error?, Never>?
 	/// Walks run strictly in order, as the browser's backfillChain.
 	private var backfillChain: Task<Result<Bool, Error>, Never>?
@@ -229,9 +234,10 @@ public actor SyncEngine {
 	/// app returned to the foreground, the network path changed, or the user
 	/// asked to refresh. Drops every relay socket (one that outlived a
 	/// suspension can be half-open and never fail), resubscribes live from the
-	/// cursor without the reconnect backoff, re-fetches gift wraps and wakes
-	/// the outbox so pending publishes go out at once. Concurrent calls share
-	/// one pass; a no-op until `start()` has brought the live subscriptions up.
+	/// cursor without the reconnect backoff, re-fetches gift wraps, wakes the
+	/// outbox so pending publishes go out at once, then catches up. Concurrent
+	/// calls share one pass; a no-op until `start()` has brought the live
+	/// subscriptions up (its own history pass covers the same ground).
 	public func resume() async {
 		if let resumeTask { return await resumeTask.value }
 		guard !stopped, liveUp else { return }
@@ -250,8 +256,34 @@ public actor SyncEngine {
 		let reachable = await fetchWraps(from: relays)
 		if stopped { return }
 		await wakeOutbox()
-		// No answer: the live loops report their failures and keep redialing.
-		if reachable { emitLiveStatus() }
+		// No answer: the live loops report their failures, keep redialing and
+		// catch up once a relay answers again.
+		if reachable { await catchUp() }
+	}
+
+	/// A live subscription only carries events newer than the cursor: one
+	/// a relay accepted at or before it (another device publishing late or
+	/// with a skewed clock, the same second) or that a dead socket dropped
+	/// while another relay moved the cursor on never arrives. A history pass
+	/// under start's rules reconciles every stream's whole set (NIP-77) and
+	/// imports whatever this device lacks. Requests made while a pass waits
+	/// for its predecessor share it; one made while a pass runs gets the next.
+	private func catchUp() async {
+		if catchUpQueued, let catchUpTail { return await catchUpTail.value }
+		let previous = catchUpTail
+		catchUpQueued = true
+		let task = Task {
+			await previous?.value
+			self.catchUpQueued = false
+			if self.stopped { return }
+			self.catchingUp += 1
+			self.emitLiveStatus()
+			await self.walkFromStore()
+			self.catchingUp -= 1
+			self.emitLiveStatus()
+		}
+		catchUpTail = task
+		await task.value
 	}
 
 	/// Test helper: resolves when no walk, import, live event, publish or
@@ -349,7 +381,8 @@ public actor SyncEngine {
 	}
 
 	private func emitLiveStatus() {
-		emit(SyncStatus(phase: liveUp ? .live : .backfill, imported: importedCount, pending: pendingCount, detail: liveUp ? statusDetail() : nil))
+		let live = liveUp && catchingUp == 0
+		emit(SyncStatus(phase: live ? .live : .backfill, imported: importedCount, pending: pendingCount, detail: !liveUp ? nil : live ? statusDetail() : "Catching up…"))
 	}
 
 	// ── Backfill ──
@@ -383,11 +416,18 @@ public actor SyncEngine {
 			try? await Task.sleep(for: Self.walkRetryDelay)
 			walkRetry = nil
 			if stopped { return }
-			let bootstrapped = (try? await store.bootstrapped()) ?? false
-			let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
-			activeWalks += 1
-			await bootstrap(since: bootstrapped ? cursor + 1 : 1, resumeUntil: floor, markBootstrapped: !bootstrapped)
+			await walkFromStore()
 		}
+	}
+
+	/// One history walk from where the store says this device stands, as
+	/// `start()` launches it: from the cursor once bootstrapped, else from the
+	/// bootstrap floor down to event zero.
+	private func walkFromStore() async {
+		let bootstrapped = (try? await store.bootstrapped()) ?? false
+		let floor: Int64? = bootstrapped ? nil : ((try? await store.bootstrapFloor()) ?? nil)
+		activeWalks += 1
+		await bootstrap(since: bootstrapped ? cursor + 1 : 1, resumeUntil: floor, markBootstrapped: !bootstrapped)
 	}
 
 	/// Walks run strictly in order: each waits for the previous one.
@@ -823,8 +863,9 @@ public actor SyncEngine {
 	/// One relay's live subscription; a dropped stream resubscribes from the
 	/// current cursor after 2 s, doubling up to 60 s. Wraps are re-queried on
 	/// every reconnect: their created_at is randomized, so no cursor covers them.
-	/// A reconnect the relay answers resets the backoff, reports live again and
-	/// wakes the outbox, whose items backed off while the socket was down.
+	/// A reconnect the relay answers resets the backoff, wakes the outbox,
+	/// whose items backed off while the socket was down, and catches up on
+	/// what the dead socket dropped before reporting live again.
 	private func liveLoop(_ relay: RelayClient, since initial: Int64, spaceTags: [String]) async {
 		var since = initial
 		var backoff = Self.liveBackoffFloor
@@ -833,7 +874,7 @@ public actor SyncEngine {
 			if reconnecting, await fetchWraps(from: [relay]), !stopped, !Task.isCancelled {
 				backoff = Self.liveBackoffFloor
 				await wakeOutbox()
-				emitLiveStatus()
+				Task { await self.catchUp() }
 			}
 			let stream = relay.subscribe(liveFilters(since: since, spaceTags: spaceTags))
 			do {

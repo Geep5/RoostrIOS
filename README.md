@@ -72,9 +72,15 @@ path change (NWPathMonitor in `AppModel`), a page (re)load, the page's
 `syncNow` (tapping the sync dot on a phone) and pulling the web view down all
 call `Backend.resume`: every relay socket is dropped (one that outlived a
 suspension can be half-open and never fail), live subscriptions resume from
-the cursor at once, gift wraps are re-fetched and the engine outbox is woken
-(`outbox_wake`) so pending publishes skip their backoff. The status indicator
-shows `Reconnecting…` until a relay answers, then live.
+the cursor at once, gift wraps are re-fetched, the engine outbox is woken
+(`outbox_wake`) so pending publishes skip their backoff, and a history pass
+under `start()`'s rules reconciles every stream (NIP-77). A subscription from
+the cursor never carries an event a relay accepted at or before it (another
+device publishing late or with a skewed clock, the same second, or one a dead
+socket dropped while another relay moved the cursor on); the reconcile
+fetches whatever the device lacks. A live socket that drops and redials on
+its own runs the same pass. The status indicator shows `Reconnecting…` until
+a relay answers, `Catching up…` while the pass runs, then live.
 
 The editor opens as soon as the identity is read: `AppModel` constructs the
 `Backend` and runs `start()` (shared-space reconcile, session, history walk,

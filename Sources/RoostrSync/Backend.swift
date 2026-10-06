@@ -161,8 +161,8 @@ public actor Backend {
 		commitSinks.removeAll()
 	}
 
-	/// Reconnects every relay now, catches up from the cursor and flushes the
-	/// outbox (`SyncEngine.resume`): foregrounding, network changes, refresh.
+	/// Reconnects every relay now, flushes the outbox and reconciles history
+	/// (`SyncEngine.resume`): foregrounding, network changes, refresh.
 	public func resume() async {
 		await engine.resume()
 	}
