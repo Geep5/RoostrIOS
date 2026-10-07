@@ -131,6 +131,10 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 		content.addUserScript(WKUserScript(source: Self.platformScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
 		content.add(self, name: Self.handlerName)
 		let webView = WKWebView(frame: .zero, configuration: configuration)
+		#if canImport(UIKit)
+		// WebKit drops alert/confirm/prompt unless a UI delegate presents them.
+		webView.uiDelegate = self
+		#endif
 		#if DEBUG
 		webView.isInspectable = true
 		#endif
@@ -411,3 +415,41 @@ public final class RoostrSchemeHandler: NSObject, WKURLSchemeHandler {
 		return candidate
 	}
 }
+
+#if canImport(UIKit)
+import UIKit
+
+/// The web app's `alert`, `confirm` and `prompt` (e.g. "Type name:" for a new
+/// type) as native alerts; without a UI delegate WebKit discards them.
+extension WebBridge: WKUIDelegate {
+	public func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+		let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+		alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
+		guard present(alert, from: webView) else { return completionHandler() }
+	}
+
+	public func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+		let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+		alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
+		alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
+		guard present(alert, from: webView) else { return completionHandler(false) }
+	}
+
+	public func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+		let alert = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+		alert.addTextField { $0.text = defaultText }
+		alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+		alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak alert] _ in completionHandler(alert?.textFields?.first?.text ?? "") })
+		guard present(alert, from: webView) else { return completionHandler(nil) }
+	}
+
+	/// Presents over whatever is frontmost; false when nothing can present (WebKit must still get an answer).
+	private func present(_ alert: UIAlertController, from webView: WKWebView) -> Bool {
+		var top = webView.window?.rootViewController
+		while let next = top?.presentedViewController { top = next }
+		guard let top else { return false }
+		top.present(alert, animated: true)
+		return true
+	}
+}
+#endif
