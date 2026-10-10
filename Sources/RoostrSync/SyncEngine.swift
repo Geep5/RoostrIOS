@@ -1128,27 +1128,64 @@ public actor SyncEngine {
 		}
 	}
 
-	/// Success is any relay's `OK true`; every rejection is reported otherwise.
+	/// Success is the first relay's `OK true`: the queue moves on at once and
+	/// the other relays finish in the background. A relay that never answers -
+	/// or never even connects (an unreachable public relay hung every change
+	/// for its whole connect attempt) - costs at most `publishTimeout`, counted
+	/// from the send, connect included. Every failure is reported when none accepts.
 	private func publishToAnyRelay(_ event: NostrEvent) async throws {
 		if relays.isEmpty { throw SyncError.noRelays }
-		let failures = await withTaskGroup(of: String?.self, returning: [String]?.self) { group in
-			for relay in relays {
-				group.addTask {
-					do {
-						try await relay.publish(event, timeout: Self.publishTimeout)
-						return nil
-					} catch {
-						return "\(relay.url): \(String(describing: error).prefix(80))"
-					}
+		let (answers, sink) = AsyncStream<String?>.makeStream()
+		for relay in relays {
+			Task {
+				let failure = await Self.within(Self.publishTimeout) { try await relay.publish(event, timeout: Self.publishTimeout) }
+				sink.yield(failure.map { "\(relay.url): \($0)" })
+			}
+		}
+		var errors: [String] = []
+		for await failure in answers {
+			guard let failure else {
+				sink.finish()
+				return
+			}
+			errors.append(failure)
+			if errors.count == relays.count { break }
+		}
+		sink.finish()
+		throw SyncError.rejected(errors.joined(separator: " | "))
+	}
+
+	/// Runs `work`, but answers by `limit` whether or not it has finished: nil
+	/// on success, the error's text otherwise. Work still hanging (a socket
+	/// handshake that never completes) is left to end on its own.
+	static func within(_ limit: Duration, _ work: @escaping @Sendable () async throws -> Void) async -> String? {
+		let once = Once()
+		return await withCheckedContinuation { (answer: CheckedContinuation<String?, Never>) in
+			Task {
+				do {
+					try await work()
+					if once.claim() { answer.resume(returning: nil) }
+				} catch {
+					if once.claim() { answer.resume(returning: String(String(describing: error).prefix(80))) }
 				}
 			}
-			var errors: [String] = []
-			var accepted = false
-			for await failure in group {
-				if let failure { errors.append(failure) } else { accepted = true }
+			Task {
+				try? await Task.sleep(for: limit)
+				if once.claim() { answer.resume(returning: "no answer within \(limit)") }
 			}
-			return accepted ? nil : errors
 		}
-		if let failures { throw SyncError.rejected(failures.joined(separator: " | ")) }
+	}
+}
+
+/// True exactly once: the first of several racers to finish answers.
+private final class Once: @unchecked Sendable {
+	private let lock = NSLock()
+	private var done = false
+	func claim() -> Bool {
+		lock.withLock {
+			if done { return false }
+			done = true
+			return true
+		}
 	}
 }

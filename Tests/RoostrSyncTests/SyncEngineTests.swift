@@ -91,6 +91,34 @@ final class SyncEngineTests: XCTestCase {
 		await engine.stop()
 	}
 
+	/// A relay that never answers EVENT (an unreachable public relay stuck in
+	/// its handshake) used to hold every change for the whole wait: with one
+	/// relay accepting, a change counts as sent at once.
+	func testOneSilentRelayDoesNotHoldUpPublishing() async throws {
+		let good = FakeRelay()
+		let silent = SilentPublishRelay()
+		let store = InMemoryChangeStore()
+		let engine = SyncEngine(key: key, relays: [silent, good], store: store)
+		await engine.start()
+
+		let change: JSONValue = .object([
+			"objectId": .string("note-1"),
+			"parentIds": .array([]),
+			"timestamp": .int(1),
+			"author": .string("t"),
+			"ops": .array([.object(["objectCreate": .object(["typeKey": .string("note")])])]),
+		])
+		let bytes = try await Engine.encode(change)
+		let decoded = try await Engine.decode(bytes)
+		let changeId = try XCTUnwrap(decoded["id"]?.string)
+		let started = ContinuousClock.now
+		try await engine.publish(bytes: bytes, changeId: changeId, objectId: "note-1")
+		_ = try await eventually { try await store.isPublished(key: changeId) ? true : nil }
+		XCTAssertLessThan(ContinuousClock.now - started, .seconds(3), "the accepting relay's OK is enough; the silent one is not awaited")
+		XCTAssertEqual(good.stored.count, 1)
+		await engine.stop()
+	}
+
 	func testRestartOnBootstrappedStoreSubscribesFromCursor() async throws {
 		let relay = FakeRelay()
 		_ = try await seed(relay)
@@ -326,4 +354,14 @@ private final class CommitLog: @unchecked Sendable {
 	deinit { task?.cancel() }
 
 	var ids: Set<String> { lock.withLock { seen } }
+}
+
+/// Answers reads like an empty relay but never answers a publish.
+private final class SilentPublishRelay: RelayClient, @unchecked Sendable {
+	let url = URL(string: "ws://silent.relay")!
+	func query(_ filters: [NostrFilter], timeout: Duration) async throws -> [NostrEvent] { [] }
+	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error> { AsyncThrowingStream { _ in } }
+	func publish(_ event: NostrEvent, timeout: Duration) async throws { try await Task.sleep(for: .seconds(3600)) }
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] { throw RelayError.unsupported("test relay") }
+	func disconnect() async {}
 }
