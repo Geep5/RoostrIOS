@@ -359,7 +359,8 @@ extension Backend {
 			var json: [String: JSONValue] = [
 				"id": .string(id),
 				"name": .string(fields?["name"]?["stringValue"]?.string ?? ""),
-				"icon": .string(fields?["iconEmoji"]?["stringValue"]?.string ?? ""),
+				// An image icon (link or upload) wins over an emoji, as on the web and the daemon.
+				"icon": .string([fields?["iconImage"]?["stringValue"]?.string, fields?["iconEmoji"]?["stringValue"]?.string].compactMap { $0 }.first { !$0.isEmpty } ?? ""),
 				"pinnedIds": .array((fields?["pinnedIds"]?["valuesValue"]?["items"]?.array ?? []).compactMap { $0["stringValue"]?.string }.filter { !$0.isEmpty }.map(JSONValue.string)),
 				"members": .array(Self.members(of: state).map { .object(["npub": .string($0.npub), "role": .string($0.role)]) }),
 				"keyId": .int(fields?["keyId"]?["intValue"]?.int ?? 1),
