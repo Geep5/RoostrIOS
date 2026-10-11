@@ -6,8 +6,9 @@ import XCTest
 /// A mutation request carries no states: the planner reads the engine's query
 /// cache (core `mutation_states`), which `applyMutation` flushes first. An
 /// object the params name that the cache lacks comes back missing and is
-/// retried once as overlay (`Backend.plan`). Same contract and test as
-/// RoostrWebsite scripts/mutation-scope.test.ts.
+/// retried once as overlay (`Backend.plan`). A local commit is applied to that
+/// cache by the engine (`Backend.applyCommitted`), so its state is not re-sent.
+/// Same contract and test as RoostrWebsite scripts/mutation-scope.test.ts.
 final class MutationScopeTests: XCTestCase {
 	/// Ids `statesOf` was asked for, across the planner's retry.
 	private actor Asked {
@@ -122,5 +123,50 @@ final class MutationScopeTests: XCTestCase {
 		                                          timestamp: 1_000, author: "scope-test", idSeed: "seed", keyId: 0)
 		guard case .plan(let plan) = response else { return XCTFail("the committed note is in the cache") }
 		XCTAssertEqual(plan.changes.count, 1)
+	}
+
+	/// A local commit is applied to the cache by the engine itself: no state
+	/// is owed to the next query push, and the next plan reads the edit.
+	func testLocalCommitIsAppliedNotUpserted() async throws {
+		let backend = Backend(key: NostrKey.generate(), relays: [], store: InMemoryChangeStore())
+		_ = try await backend.mutate(action: "create", params: .object(["type_key": .string("channel"), "name": .string("Home")]))
+		let note = try await backend.createNote(name: "Page", text: "typed")
+		func on(_ fields: [String: JSONValue]) -> JSONValue { .object(fields.merging(["object_id": .string(note)]) { $1 }) }
+		_ = try await backend.mutate(action: "set_field", params: on(["key": .string("status"), "value": .object(["stringValue": .string("draft")])]))
+		var owed = await backend.queryUpsertsOwed()
+		XCTAssertEqual(owed, [], "every local commit was applied by the engine")
+		// table_row_add plans from the table the cache holds: it must see the create.
+		let table = try await backend.mutate(action: "table_create", params: on(["rows": .int(1), "cols": .int(2)]))
+		_ = try await backend.mutate(action: "table_row_add", params: on(["table_id": table["id"] ?? .null]))
+		_ = try await backend.mutate(action: "delete", params: on([:]))
+		_ = try await backend.mutate(action: "restore", params: on([:]))
+		owed = await backend.queryUpsertsOwed()
+		XCTAssertEqual(owed, [])
+		var refusals = await backend.applyRefusals
+		XCTAssertEqual(refusals, 0)
+		let held = await backend.states[note]?.state
+		let state = try XCTUnwrap(held)
+		XCTAssertEqual(state["blocks"]?.array?.filter { $0["content"]?["tableRow"] != nil }.count, 2)
+		let rows = try await backend.query(body: .object(["filters": .array([.object(["key": .string("status"), "condition": .string("equal"), "value": .string("draft")])])]))
+		XCTAssertEqual(rows["records"]?.array?.compactMap { $0["id"]?.string }, [note], "the cache the planner reads holds the edit")
+
+		// A cached state without heads (an older replay) refuses the apply:
+		// the replayed state is owed as before, and with its heads the next
+		// commit applies again.
+		guard case .object(var headless) = state else { return XCTFail("state shape") }
+		headless["heads"] = nil
+		let _: JSONValue = try await Engine.call("query", ["upserts": .array([packCoreValueMaps(.object(headless))]), "removed": .array([]), "nowMs": .int(1)])
+		_ = try await backend.mutate(action: "set_field", params: on(["key": .string("status"), "value": .object(["stringValue": .string("refused")])]))
+		refusals = await backend.applyRefusals
+		XCTAssertEqual(refusals, 1)
+		owed = await backend.queryUpsertsOwed()
+		XCTAssertEqual(owed, [note])
+		_ = try await backend.mutate(action: "set_field", params: on(["key": .string("status"), "value": .object(["stringValue": .string("applied")])]))
+		owed = await backend.queryUpsertsOwed()
+		XCTAssertEqual(owed, [])
+		refusals = await backend.applyRefusals
+		XCTAssertEqual(refusals, 1)
+		let applied = try await backend.query(body: .object(["filters": .array([.object(["key": .string("status"), "condition": .string("equal"), "value": .string("applied")])])]))
+		XCTAssertEqual(applied["records"]?.array?.compactMap { $0["id"]?.string }, [note])
 	}
 }

@@ -291,6 +291,15 @@ public enum Engine {
 		return try await call("mutation", payload)
 	}
 
+	/// Applies one locally committed, addressed change (the engine's own
+	/// ordered-pair form) to the engine's query cache instead of re-sending its
+	/// object's state (core `query_cache_apply`). False when the cache refused:
+	/// it did not hold exactly the change's parents as heads, and is untouched.
+	public static func applyCommitted(_ change: JSONValue) async throws -> Bool {
+		let out: JSONValue = try await call("mutation", ["action": .string("apply"), "changes": .array([change])])
+		return out["applied"]?.array?.count == 1
+	}
+
 	/// Plans over the engine's query cache, which the caller has brought up
 	/// to date (`Backend.syncQueryCache`): the request carries no vault.
 	/// `overlay` states win over the cache; `absent` ids the caller looked up

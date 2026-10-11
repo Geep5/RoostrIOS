@@ -36,6 +36,10 @@ private final class QuerySignatures: @unchecked Sendable {
 		let next: [String: String]
 	}
 
+	static func signature(_ cached: Backend.Cached) -> String {
+		"\(cached.input.changeDigest):\(cached.input.checkpointHash):\(cached.input.baseHashes)"
+	}
+
 	func diff(owner: ObjectIdentifier, states: [String: Backend.Cached]) -> Diff {
 		lock.withLock {
 			let reset = self.owner != owner
@@ -43,7 +47,7 @@ private final class QuerySignatures: @unchecked Sendable {
 			next.reserveCapacity(states.count)
 			var upserts: [JSONValue] = []
 			for (id, cached) in states {
-				let signature = "\(cached.input.changeDigest):\(cached.input.checkpointHash):\(cached.input.baseHashes)"
+				let signature = Self.signature(cached)
 				next[id] = signature
 				if reset || signatures[id] != signature { upserts.append(cached.state) }
 			}
@@ -60,6 +64,19 @@ private final class QuerySignatures: @unchecked Sendable {
 		lock.withLock {
 			self.owner = owner
 			signatures = diff.next
+		}
+	}
+
+	func owns(_ owner: ObjectIdentifier) -> Bool {
+		lock.withLock { self.owner == owner }
+	}
+
+	/// The engine's cache already holds `cached` for `id` (it applied the
+	/// local commit itself): the next diff must not re-send it. A snapshot of
+	/// another owner is due a reset anyway and is left alone.
+	func adopt(owner: ObjectIdentifier, id: String, _ cached: Backend.Cached) {
+		lock.withLock {
+			if self.owner == owner { signatures[id] = Self.signature(cached) }
 		}
 	}
 
@@ -161,6 +178,33 @@ extension Backend {
 	/// `applyMutation` flushes every committed and imported change first.
 	func syncQueryCache() async throws {
 		_ = try await pushStates(body: nil)
+	}
+
+	/// `query.ts applyCommitted`: the engine applies a local commit to the
+	/// cache it plans over, so its state is not re-sent. Only into this
+	/// backend's own snapshot (another vault's is due a reset). False when the
+	/// engine refused (its heads were not the change's parents) or failed:
+	/// the replayed state is then upserted as before; the first is logged.
+	func applyCommitted(_ change: JSONValue) async -> Bool {
+		guard QuerySignatures.shared.owns(ObjectIdentifier(self)) else { return false }
+		if (try? await Engine.applyCommitted(change)) == true { return true }
+		applyRefusals += 1
+		if applyRefusals == 1 { print("[sync] query cache refused a committed change of \(change["objectId"]?.string ?? "?"); upserting its state instead") }
+		return false
+	}
+
+	/// After the replay of an applied commit: when it reached exactly that
+	/// change, it is the state the engine already caches, and is not re-sent.
+	/// A remote change replayed alongside moves the heads; the merged state is
+	/// then upserted by the next diff.
+	func adoptAppliedState(_ objectId: String, changeId: String) {
+		guard let cached = states[objectId], cached.state["heads"]?.array?.compactMap(\.string) == [changeId] else { return }
+		QuerySignatures.shared.adopt(owner: ObjectIdentifier(self), id: objectId, cached)
+	}
+
+	/// Test hook: ids of the states the next query push would send, without sending them.
+	func queryUpsertsOwed() -> [String] {
+		QuerySignatures.shared.diff(owner: ObjectIdentifier(self), states: states).upserts.compactMap { $0["id"]?.string }
 	}
 
 	private func pushStates(body: JSONValue?) async throws -> JSONValue {

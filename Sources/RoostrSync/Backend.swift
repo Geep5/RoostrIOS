@@ -49,6 +49,8 @@ public actor Backend {
 
 	/// Test hook: replays (`replay_from_base`) run by this instance; a warm start runs none.
 	private(set) var replayCount = 0
+	/// Local commits the engine's query cache refused to apply (`applyCommitted`); test hook.
+	var applyRefusals = 0
 
 	let key: NostrKey
 	let store: ChangeStore
@@ -633,9 +635,12 @@ public actor Backend {
 		let decoded = try await Engine.decode(bytes)
 		guard let id = decoded["id"]?.string else { throw BackendError.malformedPlan("encoded change without id") }
 		_ = try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: bytes, json: decoded, b: base)])
+		// The engine applies its own planned change to the cache it plans over.
+		let applied = await applyCommitted(decoded)
 		dirty.insert(objectId)
 		// The change's own scope decides whether it also goes out under a space key.
 		try await ensure()
+		if applied { adoptAppliedState(objectId, changeId: id) }
 		try await engine.publish(bytes: bytes, changeId: id, objectId: objectId, spaceId: spaceOf(objectId), base: base)
 		notify([objectId])
 	}
