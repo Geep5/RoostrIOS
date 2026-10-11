@@ -152,8 +152,14 @@ public actor Backend {
 		// Converge the bundled catalog (new relations/types the engine added
 		// since this space was seeded) - same boot step as the native daemon;
 		// idempotent, so a converged space commits nothing. It plans over every
-		// state, so it runs behind start rather than on it.
-		bootstrapTask = Task { _ = try? await self.mutate(action: "bootstrap_space_defaults", params: .object([:])) }
+		// state, so it runs behind the first history pass: seeded before that
+		// pass lands, a fresh install would publish defaults the vault already
+		// holds. A pass that fails (offline first run) still seeds.
+		bootstrapTask = Task {
+			await self.engine.awaitFirstWalk()
+			if Task.isCancelled { return }
+			_ = try? await self.mutate(action: "bootstrap_space_defaults", params: .object([:]))
+		}
 	}
 
 	public func stop() async {

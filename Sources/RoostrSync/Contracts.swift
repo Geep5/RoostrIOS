@@ -197,8 +197,6 @@ public protocol ChangeStore: Sendable {
 	func bases(objectId: String) async throws -> [BaseRecord]
 	/// Hash of each object's current base.
 	func currentBaseHashes() async throws -> [String]
-	/// created_at (unix ms) of the newest base held; nil when none is.
-	func newestBaseCreatedAt() async throws -> Int64?
 	/// Objects held as changes with no base.
 	func objectsWithoutBase() async throws -> [String]
 

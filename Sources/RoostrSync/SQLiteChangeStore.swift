@@ -240,14 +240,6 @@ public actor SQLiteChangeStore: ChangeStore {
 		return hashes
 	}
 
-	public func newestBaseCreatedAt() async throws -> Int64? {
-		let select = try statement("SELECT MAX(created_at) FROM bases")
-		try reset(select)
-		defer { sqlite3_reset(select) }
-		guard try stepRow(select), sqlite3_column_type(select, 0) != SQLITE_NULL else { return nil }
-		return sqlite3_column_int64(select, 0)
-	}
-
 	public func objectsWithoutBase() async throws -> [String] {
 		let select = try statement("SELECT DISTINCT object_id FROM changes WHERE object_id NOT IN (SELECT object_id FROM bases) ORDER BY object_id")
 		try reset(select)

@@ -239,7 +239,6 @@ actor InMemoryChangeStore: ChangeStore {
 	func currentBaseHashes() async throws -> [String] {
 		baseRecords.values.compactMap { $0.max { $1.outranks($0) }?.hash }.sorted()
 	}
-	func newestBaseCreatedAt() async throws -> Int64? { baseRecords.values.flatMap { $0 }.map(\.createdAt).max() }
 	func objectsWithoutBase() async throws -> [String] { changes.keys.filter { baseRecords[$0] == nil }.sorted() }
 
 	func checkpoint(objectId: String) async throws -> CheckpointRecord? { checkpoints[objectId] }

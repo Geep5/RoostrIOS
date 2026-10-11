@@ -319,8 +319,6 @@ final class StateSyncTests: XCTestCase {
 		XCTAssertEqual(byBase.map(\.id), ["e2"])
 		let current = try await reopened.currentBaseHashes()
 		XCTAssertEqual(current, ["h2"], "the highest epoch is current whatever its created_at")
-		let newest = try await reopened.newestBaseCreatedAt()
-		XCTAssertEqual(newest, 5_000)
 		let withoutBase = try await reopened.objectsWithoutBase()
 		XCTAssertEqual(withoutBase, ["o2"])
 		let inputs = try await reopened.replayInputs()
@@ -337,4 +335,126 @@ final class StateSyncTests: XCTestCase {
 		let held = try await store.bases(objectId: "o")
 		XCTAssertEqual(held.map(\.epoch), Array(Int64(13 - baseChainKept)...12))
 	}
+
+	// ── Per-stream floors (docs/state-sync.md "Sync on a device") ──
+
+	/// A space holds a base, the personal stream none: the space's history is
+	/// bounded to its base minus a day, the personal stream is walked whole,
+	/// so an old unbased personal object still arrives.
+	func testStreamWithoutBasesIsWalkedWholeWhileAnotherIsBounded() async throws {
+		let relay = FakeRelay()
+		let now = Int64(Date().timeIntervalSince1970)
+		let old = try await change("unbased", [Self.createNote, Self.setField("name", "old")], timestamp: 1)
+		let oldEvents = try await publishDelta(old, to: [relay], createdAt: 1_000_000)
+		let info = SharedSpaceInfo(spaceId: "s1", keyHex: String(repeating: "ab", count: 32), keyId: 1, writers: [key.pubkey], owner: nil)
+		let spaceTag = try await Engine.blind(keyHex: info.keyHex, id: "space:s1")
+		let store = try SQLiteChangeStore.inMemory()
+		try await store.recordHeld([HeldEvent(id: String(repeating: "0", count: 64), createdAt: now, kind: Engine.baseKind, author: key.pubkey, hTag: spaceTag)])
+		let engine = SyncEngine(key: key, relays: [relay], store: store)
+		await engine.setSharedSpaces([info])
+		await engine.start()
+		await engine.awaitIdle()
+
+		let changes = relay.reconcileFilters.filter { $0.kinds == [Engine.changeKind] }
+		XCTAssertTrue(changes.contains { $0.authors == [key.pubkey] && $0.tagged.isEmpty && $0.since == nil }, "the unbased personal stream is walked whole")
+		XCTAssertTrue(changes.contains { $0.tagged["h"] == [spaceTag] && $0.since == now - 86_400 }, "the based space stream is bounded to its own base")
+		XCTAssertFalse(changes.contains { $0.tagged["h"] == [spaceTag] && $0.since == nil }, "never the space stream whole")
+		let fetched = Set(relay.fetchedIds)
+		XCTAssertTrue(oldEvents.allSatisfy { fetched.contains($0.id) }, "an unbased object older than another stream's floor still arrives")
+		let held = try await store.changesFor(objectId: "unbased")
+		XCTAssertEqual(held.map(\.id), [old.id])
+		await engine.stop()
+	}
+
+	/// The vanish ledger never gets a base: a bases-first bootstrap of a
+	/// compacted vault still fetches it whole, however old its entries.
+	func testVanishLedgerIsFetchedOnABasesFirstBootstrap() async throws {
+		let vault = try await migratedVault()
+		let entry = try await change(vanishLogId, [Self.setField("gone", "doc-x")], timestamp: 5)
+		let entryEvents = try await publishDelta(entry, to: [vault.relay], createdAt: 1_000_100)
+		let store = try SQLiteChangeStore.inMemory()
+		let engine = SyncEngine(key: key, relays: [vault.relay], store: store)
+		await engine.start()
+		await engine.awaitIdle()
+
+		let fetched = Set(vault.relay.fetchedIds)
+		XCTAssertTrue(entryEvents.allSatisfy { fetched.contains($0.id) }, "the ledger is walked whole")
+		XCTAssertFalse(vault.preMigration.contains { fetched.contains($0.id) }, "the based personal stream stays bounded")
+		let ledger = try await store.changesFor(objectId: vanishLogId)
+		XCTAssertEqual(ledger.map(\.id), [entry.id])
+		await engine.stop()
+	}
+
+	private func changeCount(_ store: ChangeStore) async throws -> Int {
+		var n = 0
+		for id in try await store.objectIds() { n += try await store.changesFor(objectId: id).count }
+		return n
+	}
+
+	/// Bundled defaults converge behind the first history pass, never while
+	/// it is still landing; a pass that fails (offline) still lets them seed.
+	/// The convergence commits on every run today (it rewrites relation
+	/// `object_types`), which is what makes it observable here.
+	func testDefaultsSeedAfterTheFirstHistoryPass() async throws {
+		let relay = GatedRelay(FakeRelay())
+		let store = try SQLiteChangeStore.inMemory()
+		let backend = Backend(key: key, relays: [relay], store: store, keyring: InMemorySpaceKeyring())
+		_ = try await backend.mutate(action: "channel_create", params: .object(["name": .string("Personal")]))
+		let created = try await changeCount(store)
+		let starting = Task { await backend.start() }
+		try await Task.sleep(for: .milliseconds(500))
+		let during = try await changeCount(store)
+		XCTAssertEqual(during, created, "nothing seeds while the history pass is held")
+		relay.open()
+		await starting.value
+		let seeded = try await eventually { () -> Int? in
+			let n = try await self.changeCount(store)
+			return n > created ? n : nil
+		}
+		XCTAssertGreaterThan(seeded, created, "the defaults converge once the pass ends")
+		await backend.stop()
+
+		let offlineStore = try SQLiteChangeStore.inMemory()
+		let offline = Backend(key: NostrKey.generate(), relays: [], store: offlineStore, keyring: InMemorySpaceKeyring())
+		_ = try await offline.mutate(action: "channel_create", params: .object(["name": .string("Personal")]))
+		let before = try await changeCount(offlineStore)
+		await offline.start()
+		// The outbox never drains with no relay, so wait for the seed itself.
+		let after = try await eventually { () -> Int? in
+			let n = try await self.changeCount(offlineStore)
+			return n > before ? n : nil
+		}
+		XCTAssertGreaterThan(after, before, "an offline run still seeds")
+		await offline.stop()
+	}
+}
+
+/// A relay whose history reconciliations wait until `open()`; queries, live
+/// subscriptions and publishes pass straight through.
+private final class GatedRelay: RelayClient, @unchecked Sendable {
+	let relay: FakeRelay
+	var url: URL { relay.url }
+	private let lock = NSLock()
+	private var gated = true
+
+	init(_ relay: FakeRelay) { self.relay = relay }
+
+	func open() { lock.withLock { gated = false } }
+
+	private func pass() async {
+		while lock.withLock({ gated }) { try? await Task.sleep(for: .milliseconds(10)) }
+	}
+
+	func query(_ filters: [NostrFilter], timeout: Duration) async throws -> [NostrEvent] {
+		try await relay.query(filters, timeout: timeout)
+	}
+
+	func reconcile(_ filter: NostrFilter, local: NegentropyStorage, timeout: Duration) async throws -> [String] {
+		await pass()
+		return try await relay.reconcile(filter, local: local, timeout: timeout)
+	}
+
+	func subscribe(_ filters: [NostrFilter]) -> AsyncThrowingStream<NostrEvent, Error> { relay.subscribe(filters) }
+	func publish(_ event: NostrEvent, timeout: Duration) async throws { try await relay.publish(event, timeout: timeout) }
+	func disconnect() async { await relay.disconnect() }
 }

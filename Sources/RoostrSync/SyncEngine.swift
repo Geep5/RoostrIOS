@@ -305,6 +305,13 @@ public actor SyncEngine {
 		}
 	}
 
+	/// Resolves once the history pass `start()` launched has ended, complete
+	/// or not (its retries run on their own): an offline first run resolves
+	/// as soon as that pass fails.
+	public func awaitFirstWalk() async {
+		await walkTask?.value
+	}
+
 	private func openSession() async throws {
 		let groups = try await store.replayGroups()
 		let state: SessionState = try await Engine.sync("session", [
@@ -509,17 +516,18 @@ public actor SyncEngine {
 		}
 		try await pass(baseStreams, resumeUntil: nil, trackFloor: false)
 
-		// Dual read: with no base on any relay (a vault no computer has
-		// compacted yet) the walk is exactly the pre-base one; once bases
-		// exist, deltas come by the bases they name and history walks are
-		// bounded to the newest base minus a day - never from event zero.
+		// Dual read, per stream (docs/state-sync.md "Sync on a device"): a
+		// stream - personal, or one space - with no held base is walked whole,
+		// exactly the pre-base walk; one with bases takes deltas by the bases
+		// they name and history bounded to ITS newest base minus a day. Never a
+		// global floor: an unbased object in a stream another computer never
+		// compacted would be older than that floor and never fetched.
 		let (checkpointStreams, changeStreams): ([HistoryStream], [HistoryStream])
-		if let newest = try await store.newestBaseCreatedAt() {
-			// A chunked change still assembling needs its older parts: its group lowers the bound.
-			let bound = min(max(0, newest / 1000 - Self.baseLookbackSeconds), replayGroups.values.min() ?? Int64.max)
-			(checkpointStreams, changeStreams) = try await boundedStreams(since: since, bound: bound)
-		} else {
+		let floors = try await streamFloors()
+		if floors.personal == nil && floors.spaces.isEmpty {
 			(checkpointStreams, changeStreams) = legacyStreams(since: since)
+		} else {
+			(checkpointStreams, changeStreams) = try await boundedStreams(since: since, floors: floors)
 		}
 		// Checkpoints are walked to the end before the changes: every object
 		// renders from its cache within a few pages, then the change history
@@ -587,17 +595,40 @@ public actor SyncEngine {
 		return (checkpointStreams, changeStreams)
 	}
 
-	/// The walk once bases exist. Deltas of held bases by `#b` (any author:
-	/// space members write on the same bases), deltas of objects held with
-	/// no base by their personal `#h` stream tag, and everything newer than
-	/// `bound` (new objects, deltas on a base this device lacks, pre-upgrade
-	/// writers) by author and by space stream. Legacy checkpoints keep
-	/// importing within the bound; a space's stream deletion stays unbounded.
-	private func boundedStreams(since: Int64, bound: Int64) async throws -> (checkpoints: [HistoryStream], changes: [HistoryStream]) {
-		let walkSince = max(since, bound)
+	/// Each stream's history bound: its newest held base's created_at minus
+	/// the lookback, lowered by any chunked change still assembling (its
+	/// group needs older parts). nil for the personal stream, and no entry
+	/// for a space, when that stream holds no base.
+	private func streamFloors() async throws -> (personal: Int64?, spaces: [String: Int64]) {
+		let groupFloor = replayGroups.values.min() ?? Int64.max
+		func floor(_ bases: [HeldEvent]) -> Int64? {
+			bases.map(\.createdAt).max().map { min(max(0, $0 - Self.baseLookbackSeconds), groupFloor) }
+		}
+		let spaceTags = Set(spaces.values.map(\.spaceTag))
+		let personal = try await store.heldEvents(matching: NostrFilter(authors: [pk], kinds: [Engine.baseKind]))
+			.filter { $0.hTag.map { !spaceTags.contains($0) } ?? true }
+		var spaceFloors: [String: Int64] = [:]
+		for tag in spaceTags {
+			if let bound = floor(try await store.heldEvents(matching: NostrFilter(kinds: [Engine.baseKind], tagged: ["h": [tag]]))) {
+				spaceFloors[tag] = bound
+			}
+		}
+		return (floor(personal), spaceFloors)
+	}
+
+	/// The walk once some stream holds a base. Deltas of held bases by `#b`
+	/// (any author: space members write on the same bases); per stream,
+	/// everything newer than its bound (new objects, deltas on a base this
+	/// device lacks, pre-upgrade writers), or the whole stream when it holds
+	/// no base. A bounded personal stream also fetches whole, by their `#h`
+	/// object tags, the objects held with no base and the vanish ledger,
+	/// which never gets a base: a fresh replica must still load it. A
+	/// space's stream deletion stays unbounded.
+	private func boundedStreams(since: Int64, floors: (personal: Int64?, spaces: [String: Int64])) async throws -> (checkpoints: [HistoryStream], changes: [HistoryStream]) {
+		let personalWalk = floors.personal.map { max(since, $0) } ?? since
 		var checkpointStreams = [HistoryStream(
-			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: bound),
-			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: walkSince)
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: floors.personal),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: personalWalk)
 		)]
 		var changeStreams: [HistoryStream] = []
 		for batch in Self.batches(try await store.currentBaseHashes(), Self.tagBatch) {
@@ -607,23 +638,27 @@ public actor SyncEngine {
 				walk: NostrFilter(kinds: [Engine.changeKind], since: since, tagged: tagged)
 			))
 		}
-		var objectTags: [String] = []
-		for objectId in try await store.objectsWithoutBase() {
-			objectTags.append(try await Engine.blind(secretHex: key.secretHex, id: objectId))
-		}
-		for batch in Self.batches(objectTags, Self.tagBatch) {
-			let tagged = ["h": batch]
-			changeStreams.append(HistoryStream(
-				reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], tagged: tagged),
-				walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since, tagged: tagged)
-			))
+		if floors.personal != nil {
+			var objectTags: [String] = []
+			for objectId in Set(try await store.objectsWithoutBase() + [vanishLogId]).sorted() {
+				objectTags.append(try await Engine.blind(secretHex: key.secretHex, id: objectId))
+			}
+			for batch in Self.batches(objectTags, Self.tagBatch) {
+				let tagged = ["h": batch]
+				changeStreams.append(HistoryStream(
+					reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], tagged: tagged),
+					walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since, tagged: tagged)
+				))
+			}
 		}
 		changeStreams.append(HistoryStream(
-			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: bound),
-			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: walkSince)
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: floors.personal),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: personalWalk)
 		))
 		for space in spaces.values {
 			let tagged = ["h": [space.spaceTag]]
+			let bound = floors.spaces[space.spaceTag]
+			let walkSince = bound.map { max(since, $0) } ?? since
 			changeStreams.append(HistoryStream(
 				reconcile: NostrFilter(kinds: [Engine.changeKind], since: bound, tagged: tagged),
 				walk: NostrFilter(kinds: [Engine.changeKind], since: walkSince, tagged: tagged)
