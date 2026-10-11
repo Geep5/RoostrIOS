@@ -153,6 +153,17 @@ extension Backend {
 	/// in batches under `queryPushBudget` like `query.ts pushAndQuery`: a whole
 	/// vault in one request costs the core's request arena many times its size.
 	public func query(body: JSONValue) async throws -> JSONValue {
+		try await pushStates(body: body)
+	}
+
+	/// Brings the engine's query cache up to date without running a query:
+	/// the mutation planner reads states from it (core `mutation_states`), so
+	/// `applyMutation` flushes every committed and imported change first.
+	func syncQueryCache() async throws {
+		_ = try await pushStates(body: nil)
+	}
+
+	private func pushStates(body: JSONValue?) async throws -> JSONValue {
 		try await ensure()
 		let owner = ObjectIdentifier(self)
 		let diff = QuerySignatures.shared.diff(owner: owner, states: states)
@@ -167,7 +178,9 @@ extension Backend {
 				batch = []
 				size = 0
 			}
-			batch.append(state)
+			// Maps as ordered pairs, as the corpus replays them: the mutation
+			// planner reads these states, and its plans keep their map order.
+			batch.append(packCoreValueMaps(state))
 			size += bytes
 		}
 		batches.append(batch)
@@ -176,13 +189,14 @@ extension Backend {
 			for (index, part) in batches.enumerated() {
 				// Removals and the reset belong to the first call only, or a later
 				// batch would wipe the objects the earlier ones just loaded.
-				result = try await Engine.call("query", [
+				var request: [String: JSONValue] = [
 					"upserts": .array(part),
 					"removed": .array(index == 0 ? diff.removed.map(JSONValue.string) : []),
 					"reset": .bool(index == 0 && diff.reset),
-					"body": body,
 					"nowMs": .int(Int64(Date().timeIntervalSince1970 * 1000)),
-				])
+				]
+				if let body { request["body"] = body }
+				result = try await Engine.call("query", request)
 			}
 		} catch {
 			QuerySignatures.shared.invalidate()

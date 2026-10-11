@@ -531,18 +531,19 @@ public actor Backend {
 	}
 
 	private func applyMutation(action: String, params: JSONValue) async throws -> JSONValue {
-		try await ensure()
+		// Every committed and imported change reaches the cache the planner reads.
+		try await syncQueryCache()
 		let channelId = params["channel_id"]?.string ?? ""
 		let rotating = action == "channel_member_remove" || action == "channel_key_rotate"
 		let keyId: Int64 = rotating ? ((try keyring.get(channelId)?.keyId) ?? 0) + 1 : 0
-		let plan = try await Engine.mutation(
+		let plan = try await Self.plan(
 			action: action,
 			params: params,
-			objects: Self.mutationObjects(states.values.map(\.state), params: params),
 			timestamp: Int64(Date().timeIntervalSince1970 * 1000),
 			author: author,
 			idSeed: UUID().uuidString.lowercased(),
-			keyId: keyId
+			keyId: keyId,
+			statesOf: { ids in await self.states(of: ids) }
 		)
 		var keyringChanged = false
 		if rotating {
@@ -571,34 +572,28 @@ public actor Backend {
 		return unpackCoreValueMaps(plan.result)
 	}
 
-	/// The states a mutation plans over. The planner reads blocks only of the
-	/// objects its params name (targets, senders, recipients); every other
-	/// state goes without its blocks, which are most of a vault's bytes and
-	/// would overrun the core's per-request arena on a large one. Image icons
-	/// (`iconImage` data URLs, up to 16 KB each) go too: the planner never
-	/// reads them, and thousands of them crashed the core on an imported vault.
-	static func mutationObjects(_ states: [JSONValue], params: JSONValue) -> [JSONValue] {
-		var named: Set<String> = []
-		func collect(_ value: JSONValue) {
-			switch value {
-			case .string(let text): named.insert(text)
-			case .array(let items): items.forEach(collect)
-			case .object(let fields): fields.values.forEach(collect)
-			default: break
-			}
+	/// `mutate.ts planMutation`: plans over the engine's query cache; ids the
+	/// params name that the cache lacks come back missing, and the one retry
+	/// carries this replica's states of them as overlay and names the rest
+	/// absent, so nothing is planned as if a held object did not exist.
+	static func plan(action: String, params: JSONValue, timestamp: Int64, author: String, idSeed: String, keyId: Int64, statesOf: @Sendable ([String]) async -> [JSONValue]) async throws -> MutationPlan {
+		let missing: [String]
+		switch try await Engine.mutation(action: action, params: params, timestamp: timestamp, author: author, idSeed: idSeed, keyId: keyId) {
+		case .plan(let plan): return plan
+		case .missing(let ids): missing = ids
 		}
-		collect(params)
-		return states.map { state in
-			guard case .object(var object) = state, let id = object["id"]?.string, !named.contains(id) else {
-				return packCoreValueMaps(state)
-			}
-			if object["blocks"] != nil { object["blocks"] = .array([]) }
-			if case .object(var fields)? = object["fields"], fields["iconImage"] != nil {
-				fields["iconImage"] = nil
-				object["fields"] = .object(fields)
-			}
-			return packCoreValueMaps(.object(object))
+		let overlay = await statesOf(missing)
+		let held = Set(overlay.compactMap { $0["id"]?.string })
+		let retried = try await Engine.mutation(action: action, params: params, timestamp: timestamp, author: author, idSeed: idSeed, keyId: keyId, overlay: overlay, absent: missing.filter { !held.contains($0) })
+		switch retried {
+		case .plan(let plan): return plan
+		case .missing(let ids): throw BackendError.malformedPlan("mutation needs objects this replica cannot supply: \(ids.joined(separator: ", "))")
 		}
+	}
+
+	/// This replica's current states of `ids`; ids it does not hold are left out.
+	func states(of ids: [String]) -> [JSONValue] {
+		ids.compactMap { states[$0]?.state }
 	}
 
 	/// Creates a note and its first text block; returns the object id.

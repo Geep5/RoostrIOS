@@ -223,6 +223,24 @@ public struct MutationPlan: Decodable, Sendable {
 	}
 }
 
+/// A plan, or the ids the params name that the engine's query cache lacks
+/// (core `mutation_states`): nothing was planned, and the host retries with
+/// their states as overlay.
+public enum MutationResponse: Decodable, Sendable {
+	case plan(MutationPlan)
+	case missing([String])
+
+	enum CodingKeys: String, CodingKey { case missing }
+
+	public init(from decoder: Decoder) throws {
+		if let missing = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent([String].self, forKey: .missing) {
+			self = .missing(missing)
+		} else {
+			self = .plan(try MutationPlan(from: decoder))
+		}
+	}
+}
+
 public enum Engine {
 	public static let changeKind = 1078
 	/// One sealed Checkpoint protobuf per object (docs/checkpoint-sync.md); retired by bases, still imported.
@@ -273,16 +291,22 @@ public enum Engine {
 		return try await call("mutation", payload)
 	}
 
-	public static func mutation(action: String, params: JSONValue, objects: [JSONValue], timestamp: Int64, author: String, idSeed: String, keyId: Int64) async throws -> MutationPlan {
-		try await call("mutation", [
+	/// Plans over the engine's query cache, which the caller has brought up
+	/// to date (`Backend.syncQueryCache`): the request carries no vault.
+	/// `overlay` states win over the cache; `absent` ids the caller looked up
+	/// and does not hold.
+	public static func mutation(action: String, params: JSONValue, timestamp: Int64, author: String, idSeed: String, keyId: Int64, overlay: [JSONValue] = [], absent: [String] = []) async throws -> MutationResponse {
+		var payload: [String: JSONValue] = [
 			"action": .string(action),
 			"params": params,
-			"objects": .array(objects),
 			"timestamp": .int(timestamp),
 			"author": .string(author),
 			"id_seed": .string(idSeed),
 			"key_id": .int(keyId),
-		])
+		]
+		if !overlay.isEmpty { payload["overlay"] = .array(overlay.map(packCoreValueMaps)) }
+		if !absent.isEmpty { payload["absent"] = .array(absent.map(JSONValue.string)) }
+		return try await call("mutation", payload)
 	}
 
 	// ── wire ──
