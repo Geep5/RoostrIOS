@@ -89,8 +89,10 @@ public actor Backend {
 	/// Bumped when the memo is dropped: a scan that read it earlier must not apply its rows.
 	private var replayCacheEpoch = 0
 	private var stopped = false
-	/// `bootstrap_space_defaults`, queued once start has finished.
+	/// `bootstrap_space_defaults`, queued behind the first history pass of a start.
 	private var bootstrapTask: Task<Void, Never>?
+	/// The current start's `bootstrap_space_defaults` has run.
+	private(set) var defaultsConverged = false
 	/// Objects whose imports may have left orphans; `rebaseTask` drains them
 	/// behind the mutation queue (docs/state-sync.md "Orphans and rebase").
 	private var rebaseCandidates: Set<String> = []
@@ -155,10 +157,12 @@ public actor Backend {
 		// state, so it runs behind the first history pass: seeded before that
 		// pass lands, a fresh install would publish defaults the vault already
 		// holds. A pass that fails (offline first run) still seeds.
+		defaultsConverged = false
 		bootstrapTask = Task {
 			await self.engine.awaitFirstWalk()
 			if Task.isCancelled { return }
 			_ = try? await self.mutate(action: "bootstrap_space_defaults", params: .object([:]))
+			self.defaultsConverged = true
 		}
 	}
 

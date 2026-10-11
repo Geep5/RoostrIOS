@@ -392,39 +392,40 @@ final class StateSyncTests: XCTestCase {
 	}
 
 	/// Bundled defaults converge behind the first history pass, never while
-	/// it is still landing; a pass that fails (offline) still lets them seed.
-	/// The convergence commits on every run today (it rewrites relation
-	/// `object_types`), which is what makes it observable here.
+	/// it is still landing; a pass that fails (offline) still lets them run.
+	/// On a converged replica a later start publishes nothing.
 	func testDefaultsSeedAfterTheFirstHistoryPass() async throws {
-		let relay = GatedRelay(FakeRelay())
+		let fake = FakeRelay()
+		let relay = GatedRelay(fake)
 		let store = try SQLiteChangeStore.inMemory()
 		let backend = Backend(key: key, relays: [relay], store: store, keyring: InMemorySpaceKeyring())
 		_ = try await backend.mutate(action: "channel_create", params: .object(["name": .string("Personal")]))
-		let created = try await changeCount(store)
 		let starting = Task { await backend.start() }
 		try await Task.sleep(for: .milliseconds(500))
-		let during = try await changeCount(store)
-		XCTAssertEqual(during, created, "nothing seeds while the history pass is held")
+		let early = await backend.defaultsConverged
+		XCTAssertFalse(early, "nothing seeds while the history pass is held")
 		relay.open()
 		await starting.value
-		let seeded = try await eventually { () -> Int? in
-			let n = try await self.changeCount(store)
-			return n > created ? n : nil
-		}
-		XCTAssertGreaterThan(seeded, created, "the defaults converge once the pass ends")
+		_ = try await eventually { await backend.defaultsConverged ? true : nil }
+		await backend.awaitIdle()
 		await backend.stop()
 
-		let offlineStore = try SQLiteChangeStore.inMemory()
-		let offline = Backend(key: NostrKey.generate(), relays: [], store: offlineStore, keyring: InMemorySpaceKeyring())
+		let changes = try await changeCount(store)
+		let published = fake.stored.filter { $0.kind == Engine.changeKind }.count
+		await backend.start()
+		_ = try await eventually { await backend.defaultsConverged ? true : nil }
+		await backend.awaitIdle()
+		let again = try await changeCount(store)
+		XCTAssertEqual(again, changes, "a converged replica commits nothing on a second start")
+		XCTAssertEqual(fake.stored.filter { $0.kind == Engine.changeKind }.count, published, "and publishes nothing")
+		await backend.stop()
+
+		let offline = Backend(key: NostrKey.generate(), relays: [], store: try SQLiteChangeStore.inMemory(), keyring: InMemorySpaceKeyring())
 		_ = try await offline.mutate(action: "channel_create", params: .object(["name": .string("Personal")]))
-		let before = try await changeCount(offlineStore)
 		await offline.start()
-		// The outbox never drains with no relay, so wait for the seed itself.
-		let after = try await eventually { () -> Int? in
-			let n = try await self.changeCount(offlineStore)
-			return n > before ? n : nil
-		}
-		XCTAssertGreaterThan(after, before, "an offline run still seeds")
+		// The outbox never drains with no relay, so wait for the seeding itself.
+		let ran = try await eventually { await offline.defaultsConverged ? true : nil }
+		XCTAssertTrue(ran, "an offline run still seeds")
 		await offline.stop()
 	}
 }
