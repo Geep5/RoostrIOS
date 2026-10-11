@@ -83,36 +83,50 @@ public protocol RelayClient: Sendable {
 }
 
 /// A relay event this device holds (imported from a relay or published by it):
-/// its side of a NIP-77 reconciliation. `hTag` is the event's first `h` tag.
+/// its side of a NIP-77 reconciliation. `hTag` is the event's first `h` tag,
+/// `bTag` the base a delta was written on (`["b", hash]`).
 public struct HeldEvent: Sendable, Equatable {
 	public var id: String
 	public var createdAt: Int64
 	public var kind: Int
 	public var author: String
 	public var hTag: String?
+	public var bTag: String?
 
-	public init(id: String, createdAt: Int64, kind: Int, author: String, hTag: String?) {
-		self.id = id; self.createdAt = createdAt; self.kind = kind; self.author = author; self.hTag = hTag
+	public init(id: String, createdAt: Int64, kind: Int, author: String, hTag: String?, bTag: String? = nil) {
+		self.id = id; self.createdAt = createdAt; self.kind = kind; self.author = author; self.hTag = hTag; self.bTag = bTag
 	}
 
 	public init(_ event: NostrEvent) {
-		self.init(id: event.id, createdAt: event.created_at, kind: event.kind, author: event.pubkey, hTag: event.tag("h"))
+		self.init(id: event.id, createdAt: event.created_at, kind: event.kind, author: event.pubkey, hTag: event.tag("h"), bTag: event.tag("b"))
 	}
 }
 
 /// One stored change: exact wire bytes plus the engine's decoded JSON (`codec decode` shape).
+/// `b` is the base hash its event named (nil = pre-migration or written with
+/// no base); `rebased` marks an orphan this device rebased: never replayed again.
 public struct ChangeRecord: Sendable, Equatable {
 	public let id: String
 	public let objectId: String
 	public let bytes: Data
 	public let json: JSONValue
+	public let b: String?
+	public let rebased: Bool
 
-	public init(id: String, objectId: String, bytes: Data, json: JSONValue) {
-		self.id = id; self.objectId = objectId; self.bytes = bytes; self.json = json
+	public init(id: String, objectId: String, bytes: Data, json: JSONValue, b: String? = nil, rebased: Bool = false) {
+		self.id = id; self.objectId = objectId; self.bytes = bytes; self.json = json; self.b = b; self.rebased = rebased
+	}
+
+	/// The change as the core's state-sync actions read it: ChangeJSON plus `b`.
+	public var stateSyncJSON: JSONValue {
+		guard let b, case .object(var fields) = json else { return json }
+		fields["b"] = .string(b)
+		return .object(fields)
 	}
 }
 
 /// Durable publication obligation, keyed `changeId` (personal) or `spaceId/keyId/changeId` (shared).
+/// `base` is the hash of the base the change was written on: its events carry `["b", base]`.
 public struct PendingPublish: Codable, Sendable, Equatable {
 	public var key: String
 	public var objectId: String
@@ -120,11 +134,12 @@ public struct PendingPublish: Codable, Sendable, Equatable {
 	public var bytes: Data
 	public var spaceId: String?
 	public var keyId: Int64?
+	public var base: String?
 	/// Exact signed ciphertext retained across retries and relaunches.
 	public var events: [NostrEvent]?
 
-	public init(key: String, objectId: String, changeId: String, bytes: Data, spaceId: String? = nil, keyId: Int64? = nil, events: [NostrEvent]? = nil) {
-		self.key = key; self.objectId = objectId; self.changeId = changeId; self.bytes = bytes; self.spaceId = spaceId; self.keyId = keyId; self.events = events
+	public init(key: String, objectId: String, changeId: String, bytes: Data, spaceId: String? = nil, keyId: Int64? = nil, base: String? = nil, events: [NostrEvent]? = nil) {
+		self.key = key; self.objectId = objectId; self.changeId = changeId; self.bytes = bytes; self.spaceId = spaceId; self.keyId = keyId; self.base = base; self.events = events
 	}
 }
 
@@ -143,14 +158,49 @@ public struct CheckpointRecord: Sendable, Equatable {
 	}
 }
 
+/// One object's base (kind 31078, docs/state-sync.md): a Checkpoint protobuf
+/// of epoch >= 1 as received. `hash` is its identity; `createdAt` is unix ms.
+/// The current base is the highest epoch, then `createdAt`, then hash.
+public struct BaseRecord: Sendable, Equatable {
+	public let objectId: String
+	public let hash: String
+	public let epoch: Int64
+	public let createdAt: Int64
+	public let bytes: Data
+
+	public init(objectId: String, hash: String, epoch: Int64, createdAt: Int64, bytes: Data) {
+		self.objectId = objectId; self.hash = hash; self.epoch = epoch; self.createdAt = createdAt; self.bytes = bytes
+	}
+
+	/// The state-sync current-base order: epoch, then created_at, then hash.
+	public func outranks(_ other: BaseRecord) -> Bool {
+		(epoch, createdAt, hash) > (other.epoch, other.createdAt, other.hash)
+	}
+}
+
 /// Persistence the sync loop needs; mirrors the browser's IndexedDB stores
 /// (`changes`, `checkpoints`, `meta`) so behavior stays comparable. All methods are idempotent.
 public protocol ChangeStore: Sendable {
 	/// Adds records not already present (by id). Returns how many were new.
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int
+	/// Every stored change of the object, rebased orphans included, in insertion order.
 	func changesFor(objectId: String) async throws -> [ChangeRecord]
-	/// Every object held as changes or as a checkpoint.
+	/// Every object held as changes, a checkpoint or a base.
 	func objectIds() async throws -> [String]
+	/// Marks orphans this device rebased: kept as history, never replayed again.
+	func markRebased(_ ids: [String]) async throws
+
+	/// Stores a base unless held (by object and hash); keeps at most the
+	/// newest `baseChainKept` epochs per object. Returns whether it was new.
+	func putBase(_ record: BaseRecord) async throws -> Bool
+	/// Every base held for the object (the current one and superseded ones still kept).
+	func bases(objectId: String) async throws -> [BaseRecord]
+	/// Hash of each object's current base.
+	func currentBaseHashes() async throws -> [String]
+	/// created_at (unix ms) of the newest base held; nil when none is.
+	func newestBaseCreatedAt() async throws -> Int64?
+	/// Objects held as changes with no base.
+	func objectsWithoutBase() async throws -> [String]
 
 	func checkpoint(objectId: String) async throws -> CheckpointRecord?
 	/// Keeps `record` when it beats the stored one: more covered wins, then the larger hash. Returns whether it was stored.
@@ -178,27 +228,36 @@ public protocol ChangeStore: Sendable {
 
 	/// Remembers relay events this device holds; idempotent by id.
 	func recordHeld(_ events: [HeldEvent]) async throws
-	/// Held events matching `filter`'s `kinds`, `authors`, `#h`, `since` and
-	/// `until` (other fields are ignored): the local set of a reconciliation.
+	/// Held events matching `filter`'s `kinds`, `authors`, `#h`, `#b`, `since`
+	/// and `until` (other fields are ignored): the local set of a reconciliation.
 	func heldEvents(matching filter: NostrFilter) async throws -> [HeldEvent]
 }
 
-/// Exactly what `Engine.replay` consumes for one object: its stored change
-/// ids in replay (insertion) order and the checkpoint it seeds from. A change
-/// id is the hash of its bytes, so equal inputs replay to equal states.
+/// Superseded bases a store keeps per object beside the current one: enough
+/// of the chain to decide most orphans (docs/state-sync.md "Stale"), bounded
+/// so a device online across every compaction does not hold every epoch.
+public let baseChainKept: Int64 = 8
+
+/// Exactly what a replay consumes for one object: its stored change ids in
+/// replay (insertion) order, rebased orphans left out, the checkpoint it seeds
+/// from and the bases it holds. A change id is the hash of its bytes and a
+/// base hash the hash of the base, so equal inputs replay to equal states.
 public struct ReplayInput: Sendable, Equatable {
 	public let changeCount: Int
 	/// `ReplayInput.digest(changeIds:)` of the stored changes.
 	public let changeDigest: String
 	/// Checkpoint hash the state is replayed on top of; "" for none.
 	public let checkpointHash: String
+	/// The held bases' hashes, sorted and comma-joined; "" for none. A new
+	/// base (or one pruned) changes the current base and so the state.
+	public let baseHashes: String
 
-	public init(changeCount: Int, changeDigest: String, checkpointHash: String) {
-		self.changeCount = changeCount; self.changeDigest = changeDigest; self.checkpointHash = checkpointHash
+	public init(changeCount: Int, changeDigest: String, checkpointHash: String, baseHashes: String = "") {
+		self.changeCount = changeCount; self.changeDigest = changeDigest; self.checkpointHash = checkpointHash; self.baseHashes = baseHashes
 	}
 
-	public init(changeIds: [String], checkpointHash: String) {
-		self.init(changeCount: changeIds.count, changeDigest: Self.digest(changeIds: changeIds), checkpointHash: checkpointHash)
+	public init(changeIds: [String], checkpointHash: String, baseHashes: [String] = []) {
+		self.init(changeCount: changeIds.count, changeDigest: Self.digest(changeIds: changeIds), checkpointHash: checkpointHash, baseHashes: baseHashes.sorted().joined(separator: ","))
 	}
 
 	/// sha256 hex over each id followed by a newline, in replay order.

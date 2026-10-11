@@ -130,10 +130,11 @@ extension Backend {
 
 			for info in infos {
 				for objectId in states.keys where spaceOf(objectId) == info.spaceId {
-					for change in try await store.changesFor(objectId: objectId) {
+					// A rebased orphan is replaced by its rebase: never published on its own.
+					for change in try await store.changesFor(objectId: objectId) where !change.rebased {
 						if try await store.isPublished(key: "\(info.spaceId)/\(info.keyId)/\(change.id)") { continue }
 						// Existing IDs address original wire bytes, not a canonical re-encoding.
-						try await engine.publish(bytes: change.bytes, changeId: change.id, objectId: objectId, spaceId: info.spaceId)
+						try await engine.publish(bytes: change.bytes, changeId: change.id, objectId: objectId, spaceId: info.spaceId, base: change.b)
 					}
 				}
 			}

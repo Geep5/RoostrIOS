@@ -24,8 +24,9 @@ let vanishLogId = "__vanished__"
 
 public actor Backend {
 	struct Cached {
-		/// The changes and checkpoint the state was replayed from: replacing
-		/// 500 changes with one checkpoint must not read as "unchanged".
+		/// The changes, checkpoint and bases the state was replayed from:
+		/// replacing 500 changes with one checkpoint, or a new base landing,
+		/// must not read as "unchanged".
 		let input: ReplayInput
 		let state: JSONValue
 	}
@@ -41,7 +42,12 @@ public actor Backend {
 		states[id].map { "\($0.input.changeCount):\($0.input.checkpointHash)" }
 	}
 
-	/// Test hook: `Engine.replay` runs by this instance; a warm start runs none.
+	/// Test hook: the base hashes the cached state was replayed under (sorted, comma-joined).
+	func cachedBaseHashes(id: String) -> String? {
+		states[id]?.input.baseHashes
+	}
+
+	/// Test hook: replays (`replay_from_base`) run by this instance; a warm start runs none.
 	private(set) var replayCount = 0
 
 	let key: NostrKey
@@ -85,6 +91,10 @@ public actor Backend {
 	private var stopped = false
 	/// `bootstrap_space_defaults`, queued once start has finished.
 	private var bootstrapTask: Task<Void, Never>?
+	/// Objects whose imports may have left orphans; `rebaseTask` drains them
+	/// behind the mutation queue (docs/state-sync.md "Orphans and rebase").
+	private var rebaseCandidates: Set<String> = []
+	private var rebaseTask: Task<Void, Never>?
 
 	public init(key: NostrKey, relays: [RelayClient], store: ChangeStore, keyring: SpaceKeyring = KeychainSpaceKeyring()) {
 		self.key = key
@@ -156,6 +166,9 @@ public actor Backend {
 		wrapTask = nil
 		spaceVanishTask?.cancel()
 		spaceVanishTask = nil
+		rebaseTask?.cancel()
+		rebaseTask = nil
+		rebaseCandidates.removeAll()
 		await engine.stop()
 		for sink in commitSinks.values { sink.finish() }
 		commitSinks.removeAll()
@@ -171,6 +184,7 @@ public actor Backend {
 		await bootstrapTask?.value
 		await refreshChain?.value
 		await engine.awaitIdle()
+		await rebaseTask?.value
 		await replayWriter?.value
 	}
 
@@ -195,6 +209,8 @@ public actor Backend {
 		// A synced commit on a space object can change members or keys; one on
 		// the ledger can vanish a space.
 		if ids.contains(where: { $0 == vanishLogId || states[$0]?.state["typeKey"]?.string == "channel" || (try? keyring.get($0)) != nil }) { scheduleRefreshShared() }
+		// A new base can turn held deltas into orphans; a delta can arrive as one.
+		scheduleRebase(ids)
 	}
 
 	private func notify(_ ids: [String]) {
@@ -249,14 +265,15 @@ public actor Backend {
 		}
 		var fresh: [(id: String, input: ReplayInput, state: JSONValue)] = []
 		for id in ids {
-			let changes = try await store.changesFor(objectId: id)
-			let checkpoint = try await store.checkpoint(objectId: id)
-			if changes.isEmpty && checkpoint == nil { states[id] = nil; continue }
-			let input = ReplayInput(changeIds: changes.map(\.id), checkpointHash: checkpoint?.hash ?? "")
+			let holdings = try await ObjectHoldings.load(store, objectId: id)
+			if holdings.isEmpty { states[id] = nil; continue }
+			let input = holdings.replayInput
 			if states[id]?.input == input { continue }
 			replayCount += 1
 			do {
-				if let state = try await Engine.replay(changes.map(\.json), checkpoint: checkpoint?.bytes) {
+				// State = current base + live deltas; with no base, the
+				// checkpoint-seeded replay of every held change, as before.
+				if let state = try await Engine.replayFromBase(holdings) {
 					states[id] = Cached(input: input, state: state)
 					fresh.append((id, input, state))
 				}
@@ -436,6 +453,73 @@ public actor Backend {
 		return try await work.value
 	}
 
+	// ── Orphans ──
+
+	private func scheduleRebase(_ ids: [String]) {
+		if stopped { return }
+		rebaseCandidates.formUnion(ids)
+		if rebaseTask == nil { rebaseTask = Task { await self.drainRebases() } }
+	}
+
+	private func drainRebases() async {
+		defer { rebaseTask = nil }
+		while !rebaseCandidates.isEmpty, !stopped, !Task.isCancelled {
+			let ids = rebaseCandidates.sorted()
+			rebaseCandidates.removeAll()
+			for id in ids where !stopped && !Task.isCancelled {
+				// Behind the queued mutations: a rebase reads, plans and commits one object's heads as they do.
+				let previous = mutationTail
+				let work = Task {
+					await previous?.value
+					// A rebase that fails is retried when the object next imports.
+					try? await self.rebaseOrphans(of: id)
+				}
+				mutationTail = work
+				await work.value
+			}
+		}
+	}
+
+	/// Re-applies the object's orphans (held deltas written on a base the
+	/// current one did not fold) on the current base and publishes them with
+	/// its `b` through the outbox; the orphans are marked rebased, so they are
+	/// never replayed or rebased again. A pending orphan's own publication is
+	/// dropped: its rebase replaces it. Any device of the personal vault
+	/// rebases; in a shared space only an identity that may write it.
+	private func rebaseOrphans(of objectId: String) async throws {
+		if stopped || vanished.contains(objectId) { return }
+		let pendings = try await store.pendingPublishes()
+		let holdings = try await ObjectHoldings.load(store, objectId: objectId, pending: Set(pendings.map(\.changeId)))
+		guard !holdings.bases.isEmpty, !holdings.changes.isEmpty else { return }
+		let classes = try await Engine.classify(holdings)
+		if classes.orphan.isEmpty { return }
+		try await ensure()
+		let spaceId = spaceOf(objectId)
+		guard await mayRebase(spaceId: spaceId) else { return }
+		let rebased = try await Engine.rebase(holdings, orphans: classes.orphan)
+		for item in rebased.changes {
+			guard let bytes = Data(base64Encoded: item.bytes) else { throw BackendError.malformedPlan("rebase returned invalid bytes") }
+			// Stored as a relay import would store it, byte for byte.
+			let decoded = try await Engine.decode(bytes)
+			_ = try await store.addChanges([ChangeRecord(id: item.id, objectId: objectId, bytes: bytes, json: decoded, b: rebased.base)])
+			try await engine.publish(bytes: bytes, changeId: item.id, objectId: objectId, spaceId: spaceId, base: rebased.base)
+			for pending in pendings where pending.changeId == item.orphan { try await store.markPublished(key: pending.key) }
+			try await store.markRebased([item.orphan])
+		}
+		dirty.insert(objectId)
+		try await ensure()
+		notify([objectId])
+	}
+
+	/// Personal objects and spaces this identity administers: always. A space
+	/// someone else administers: only as one of its writers.
+	private func mayRebase(spaceId: String) async -> Bool {
+		if spaceId.isEmpty { return true }
+		guard let entry = try? keyring.get(spaceId) else { return false }
+		if spaceOwner(entry).isEmpty { return true }
+		return await engine.mayWrite(spaceId: spaceId)
+	}
+
 	private func applyMutation(action: String, params: JSONValue) async throws -> JSONValue {
 		try await ensure()
 		let channelId = params["channel_id"]?.string ?? ""
@@ -515,20 +599,33 @@ public actor Backend {
 	}
 
 	/// Encodes, addresses, durably persists and publishes one planned change.
+	/// On an object with a base the change is a delta of the current base:
+	/// its parents are the live heads plus the base heads nothing live built
+	/// on, and it goes out with `["b", base]`.
 	private func commit(_ planned: JSONValue) async throws {
 		guard var fields = planned.object, let objectId = fields["objectId"]?.string else { throw BackendError.malformedPlan("change without objectId") }
-		let history = try await store.changesFor(objectId: objectId)
-		let checkpoint = try await store.checkpoint(objectId: objectId)
-		fields["parentIds"] = .array(try await Engine.heads(history.map(\.json), checkpoint: checkpoint?.bytes).map(JSONValue.string))
+		let holdings = try await ObjectHoldings.load(store, objectId: objectId)
+		let parents: [String]
+		var base: String?
+		if let current = holdings.currentBase {
+			let classes = try await Engine.classify(holdings)
+			let onto = holdings.bases.first { $0.hash == classes.base?.hash } ?? current
+			let live = Set(classes.live)
+			parents = try await Engine.heads(holdings.changes.filter { live.contains($0.id) }.map(\.json), checkpoint: onto.bytes)
+			base = onto.hash
+		} else {
+			parents = try await Engine.heads(holdings.changes.map(\.json), checkpoint: holdings.checkpoint?.bytes)
+		}
+		fields["parentIds"] = .array(parents.map(JSONValue.string))
 		let bytes = try await Engine.encode(.object(fields))
 		// Round-trip through decode so the stored JSON matches relay-imported changes byte for byte.
 		let decoded = try await Engine.decode(bytes)
 		guard let id = decoded["id"]?.string else { throw BackendError.malformedPlan("encoded change without id") }
-		_ = try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: bytes, json: decoded)])
+		_ = try await store.addChanges([ChangeRecord(id: id, objectId: objectId, bytes: bytes, json: decoded, b: base)])
 		dirty.insert(objectId)
 		// The change's own scope decides whether it also goes out under a space key.
 		try await ensure()
-		try await engine.publish(bytes: bytes, changeId: id, objectId: objectId, spaceId: spaceOf(objectId))
+		try await engine.publish(bytes: bytes, changeId: id, objectId: objectId, spaceId: spaceOf(objectId), base: base)
 		notify([objectId])
 	}
 }

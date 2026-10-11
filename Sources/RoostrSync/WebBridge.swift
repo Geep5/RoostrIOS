@@ -55,12 +55,15 @@ public enum WebBridgeError: Error, CustomStringConvertible, Equatable {
 	case notStarted
 	case unknownMethod(String)
 	case badArgument(String)
+	/// The bridge will not do this for the page (e.g. sign a kind other than Blossom auth).
+	case refused(String)
 
 	public var description: String {
 		switch self {
 		case .notStarted: return "no key"
 		case .unknownMethod(let name): return "unknown bridge method \(name)"
 		case .badArgument(let detail): return "bad bridge argument: \(detail)"
+		case .refused(let detail): return detail
 		}
 	}
 }
@@ -107,6 +110,8 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 	public static let startURL = URL(string: "roostr://app/app")!
 	/// Selects the website's `ios` backend; explicit, like `VITE_ROOSTR_BACKEND`.
 	public static let platformScript = "window.__ROOSTR_PLATFORM = \"ios\";"
+	/// BUD-11 Blossom authorization: the only kind `signEvent` signs for the page.
+	public static let blossomAuthKind = 24242
 
 	private let host: WebBridgeHost
 	private weak var webView: WKWebView?
@@ -292,9 +297,39 @@ public final class WebBridge: NSObject, WKScriptMessageHandler {
 				throw WebBridgeError.badArgument("importSpaceInvite needs space, owner, key, keyId")
 			}
 			return try await backend().importSpaceInvite(space: space, owner: owner, key: key, keyId: keyId)
+		case "signEvent":
+			return try Self.signEvent(try object(args, 0, "signEvent template"), key: try key())
 		default:
 			throw WebBridgeError.unknownMethod(method)
 		}
+	}
+
+	/// Signs `{kind, created_at, tags, content}` with the identity key for the
+	/// page's Blossom uploads (docs/state-sync.md "Files on Blossom"): only a
+	/// kind-24242 authorization, never anything that could pose as a change
+	/// or a message. `created_at` defaults to now. Returns the signed event.
+	static func signEvent(_ template: JSONValue, key: NostrKey) throws -> NostrEvent {
+		guard let kind = template["kind"]?.int else { throw WebBridgeError.badArgument("signEvent template needs a numeric kind") }
+		guard kind == Int64(blossomAuthKind) else {
+			throw WebBridgeError.refused("signEvent only signs kind \(blossomAuthKind) (Blossom authorization), not kind \(kind)")
+		}
+		guard let content = template["content"]?.string else { throw WebBridgeError.badArgument("signEvent template needs string content") }
+		guard let rawTags = template["tags"]?.array else { throw WebBridgeError.badArgument("signEvent template needs tags") }
+		let tags = try rawTags.map { tag -> [String] in
+			guard let items = tag.array, !items.isEmpty else { throw WebBridgeError.badArgument("signEvent tags must be non-empty string arrays") }
+			return try items.map { item in
+				guard let text = item.string else { throw WebBridgeError.badArgument("signEvent tags must be non-empty string arrays") }
+				return text
+			}
+		}
+		let createdAt: Int64
+		switch template["created_at"] {
+		case nil, .null?: createdAt = Int64(Date().timeIntervalSince1970)
+		case .some(let value):
+			guard let seconds = value.int else { throw WebBridgeError.badArgument("signEvent created_at must be unix seconds") }
+			createdAt = seconds
+		}
+		return try key.sign(kind: blossomAuthKind, createdAt: createdAt, tags: tags, content: content)
 	}
 
 	private func string(_ args: [JSONValue], _ index: Int, _ what: String) throws -> String {

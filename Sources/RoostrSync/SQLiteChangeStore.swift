@@ -16,11 +16,14 @@ public struct StoreError: Error, CustomStringConvertible, Sendable {
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-/// `ChangeStore` over the system SQLite. Three tables mirror the browser's
-/// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order),
-/// `checkpoints` (one per object) and `meta` (string key/value); `held` lists
-/// the relay events this device holds, for NIP-77; `replay_cache` memoizes
-/// replayed states (`ReplayCacheStore`). Statements are prepared once and reused.
+/// `ChangeStore` over the system SQLite. Tables mirror the browser's
+/// IndexedDB stores: `changes` (wire bytes + decoded JSON, in insertion order,
+/// with the base a delta named and the rebased mark), `checkpoints` (one per
+/// object), `bases` (kind-31078 bases by object and hash) and `meta` (string
+/// key/value); `held` lists the relay events this device holds, for NIP-77;
+/// `replay_cache` memoizes replayed states (`ReplayCacheStore`). Columns a
+/// newer build added are migrated in place on open, keeping every row.
+/// Statements are prepared once and reused.
 public actor SQLiteChangeStore: ChangeStore {
 	private var db: OpaquePointer?
 	private var statements: [String: OpaquePointer] = [:]
@@ -45,9 +48,13 @@ public actor SQLiteChangeStore: ChangeStore {
 					object_id TEXT NOT NULL,
 					seq INTEGER NOT NULL,
 					bytes BLOB NOT NULL,
-					json TEXT NOT NULL
+					json TEXT NOT NULL,
+					b TEXT,
+					rebased INTEGER NOT NULL DEFAULT 0
 				)
 				""")
+			try Self.addColumn(opened, table: "changes", column: "b", "b TEXT")
+			try Self.addColumn(opened, table: "changes", column: "rebased", "rebased INTEGER NOT NULL DEFAULT 0")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS changes_object_id ON changes(object_id, seq)")
 			try Self.exec(opened, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 			try Self.exec(opened, """
@@ -60,16 +67,29 @@ public actor SQLiteChangeStore: ChangeStore {
 				)
 				""")
 			try Self.exec(opened, """
+				CREATE TABLE IF NOT EXISTS bases (
+					object_id TEXT NOT NULL,
+					hash TEXT NOT NULL,
+					epoch INTEGER NOT NULL,
+					created_at INTEGER NOT NULL,
+					bytes BLOB NOT NULL,
+					PRIMARY KEY (object_id, hash)
+				)
+				""")
+			try Self.exec(opened, """
 				CREATE TABLE IF NOT EXISTS held (
 					id TEXT PRIMARY KEY,
 					created_at INTEGER NOT NULL,
 					kind INTEGER NOT NULL,
 					author TEXT NOT NULL,
-					h TEXT
+					h TEXT,
+					b TEXT
 				)
 				""")
+			try Self.addColumn(opened, table: "held", column: "b", "b TEXT")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_author ON held(author, kind)")
 			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_h ON held(h, kind)")
+			try Self.exec(opened, "CREATE INDEX IF NOT EXISTS held_b ON held(b, kind)")
 			try Self.exec(opened, """
 				CREATE TABLE IF NOT EXISTS replay_cache (
 					object_id TEXT PRIMARY KEY,
@@ -77,9 +97,11 @@ public actor SQLiteChangeStore: ChangeStore {
 					change_count INTEGER NOT NULL,
 					change_digest TEXT NOT NULL,
 					checkpoint_hash TEXT NOT NULL,
-					state BLOB NOT NULL
+					state BLOB NOT NULL,
+					base_hashes TEXT NOT NULL DEFAULT ''
 				)
 				""")
+			try Self.addColumn(opened, table: "replay_cache", column: "base_hashes", "base_hashes TEXT NOT NULL DEFAULT ''")
 		} catch {
 			sqlite3_close(opened)
 			throw error
@@ -109,7 +131,7 @@ public actor SQLiteChangeStore: ChangeStore {
 	public func addChanges(_ records: [ChangeRecord]) async throws -> Int {
 		if records.isEmpty { return 0 }
 		return try transaction {
-			let insert = try statement("INSERT OR IGNORE INTO changes (id, object_id, seq, bytes, json) VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM changes), ?, ?)")
+			let insert = try statement("INSERT OR IGNORE INTO changes (id, object_id, seq, bytes, json, b, rebased) VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM changes), ?, ?, ?, ?)")
 			var inserted = 0
 			for record in records {
 				try reset(insert)
@@ -118,6 +140,8 @@ public actor SQLiteChangeStore: ChangeStore {
 				try bind(insert, 2, record.objectId)
 				try bind(insert, 3, record.bytes)
 				try bind(insert, 4, String(decoding: json, as: UTF8.self))
+				if let b = record.b { try bind(insert, 5, b) }
+				try bind(insert, 6, Int64(record.rebased ? 1 : 0))
 				try stepDone(insert)
 				inserted += Int(sqlite3_changes(try handle()))
 			}
@@ -126,7 +150,7 @@ public actor SQLiteChangeStore: ChangeStore {
 	}
 
 	public func changesFor(objectId: String) async throws -> [ChangeRecord] {
-		let select = try statement("SELECT id, bytes, json FROM changes WHERE object_id = ? ORDER BY seq")
+		let select = try statement("SELECT id, bytes, json, b, rebased FROM changes WHERE object_id = ? ORDER BY seq")
 		try reset(select)
 		try bind(select, 1, objectId)
 		var records: [ChangeRecord] = []
@@ -134,7 +158,8 @@ public actor SQLiteChangeStore: ChangeStore {
 			let id = columnText(select, 0)
 			let bytes = columnBlob(select, 1)
 			let json = try decoder.decode(JSONValue.self, from: Data(columnText(select, 2).utf8))
-			records.append(ChangeRecord(id: id, objectId: objectId, bytes: bytes, json: json))
+			let b = sqlite3_column_type(select, 3) == SQLITE_NULL ? nil : columnText(select, 3)
+			records.append(ChangeRecord(id: id, objectId: objectId, bytes: bytes, json: json, b: b, rebased: sqlite3_column_int64(select, 4) != 0))
 		}
 		sqlite3_reset(select)
 		return records
@@ -145,8 +170,86 @@ public actor SQLiteChangeStore: ChangeStore {
 			SELECT object_id FROM (
 				SELECT object_id, MIN(seq) AS first FROM changes GROUP BY object_id
 				UNION SELECT object_id, NULL FROM checkpoints WHERE object_id NOT IN (SELECT object_id FROM changes)
+				UNION SELECT object_id, NULL FROM bases WHERE object_id NOT IN (SELECT object_id FROM changes)
 			) ORDER BY first IS NULL, first
 			""")
+		try reset(select)
+		var ids: [String] = []
+		while try stepRow(select) { ids.append(columnText(select, 0)) }
+		sqlite3_reset(select)
+		return ids
+	}
+
+	public func markRebased(_ ids: [String]) async throws {
+		if ids.isEmpty { return }
+		try transaction {
+			let update = try statement("UPDATE changes SET rebased = 1 WHERE id = ?")
+			for id in ids {
+				try reset(update)
+				try bind(update, 1, id)
+				try stepDone(update)
+			}
+		}
+	}
+
+	// MARK: bases
+
+	public func putBase(_ record: BaseRecord) async throws -> Bool {
+		try transaction {
+			let insert = try statement("INSERT OR IGNORE INTO bases (object_id, hash, epoch, created_at, bytes) VALUES (?, ?, ?, ?, ?)")
+			try reset(insert)
+			try bind(insert, 1, record.objectId)
+			try bind(insert, 2, record.hash)
+			try bind(insert, 3, record.epoch)
+			try bind(insert, 4, record.createdAt)
+			try bind(insert, 5, record.bytes)
+			try stepDone(insert)
+			guard sqlite3_changes(try handle()) > 0 else { return false }
+			let prune = try statement("DELETE FROM bases WHERE object_id = ?1 AND epoch <= (SELECT MAX(epoch) FROM bases WHERE object_id = ?1) - ?2")
+			try reset(prune)
+			try bind(prune, 1, record.objectId)
+			try bind(prune, 2, baseChainKept)
+			try stepDone(prune)
+			return true
+		}
+	}
+
+	public func bases(objectId: String) async throws -> [BaseRecord] {
+		let select = try statement("SELECT hash, epoch, created_at, bytes FROM bases WHERE object_id = ? ORDER BY epoch, created_at, hash")
+		try reset(select)
+		try bind(select, 1, objectId)
+		var records: [BaseRecord] = []
+		while try stepRow(select) {
+			records.append(BaseRecord(objectId: objectId, hash: columnText(select, 0), epoch: sqlite3_column_int64(select, 1), createdAt: sqlite3_column_int64(select, 2), bytes: columnBlob(select, 3)))
+		}
+		sqlite3_reset(select)
+		return records
+	}
+
+	public func currentBaseHashes() async throws -> [String] {
+		let select = try statement("""
+			SELECT hash FROM bases AS b WHERE NOT EXISTS (
+				SELECT 1 FROM bases AS o WHERE o.object_id = b.object_id AND (o.epoch > b.epoch OR (o.epoch = b.epoch AND
+					(o.created_at > b.created_at OR (o.created_at = b.created_at AND o.hash > b.hash))))
+			) ORDER BY hash
+			""")
+		try reset(select)
+		var hashes: [String] = []
+		while try stepRow(select) { hashes.append(columnText(select, 0)) }
+		sqlite3_reset(select)
+		return hashes
+	}
+
+	public func newestBaseCreatedAt() async throws -> Int64? {
+		let select = try statement("SELECT MAX(created_at) FROM bases")
+		try reset(select)
+		defer { sqlite3_reset(select) }
+		guard try stepRow(select), sqlite3_column_type(select, 0) != SQLITE_NULL else { return nil }
+		return sqlite3_column_int64(select, 0)
+	}
+
+	public func objectsWithoutBase() async throws -> [String] {
+		let select = try statement("SELECT DISTINCT object_id FROM changes WHERE object_id NOT IN (SELECT object_id FROM bases) ORDER BY object_id")
 		try reset(select)
 		var ids: [String] = []
 		while try stepRow(select) { ids.append(columnText(select, 0)) }
@@ -288,7 +391,7 @@ public actor SQLiteChangeStore: ChangeStore {
 	public func recordHeld(_ events: [HeldEvent]) async throws {
 		if events.isEmpty { return }
 		try transaction {
-			let insert = try statement("INSERT OR IGNORE INTO held (id, created_at, kind, author, h) VALUES (?, ?, ?, ?, ?)")
+			let insert = try statement("INSERT OR IGNORE INTO held (id, created_at, kind, author, h, b) VALUES (?, ?, ?, ?, ?, ?)")
 			for event in events {
 				try reset(insert)
 				try bind(insert, 1, event.id)
@@ -296,6 +399,7 @@ public actor SQLiteChangeStore: ChangeStore {
 				try bind(insert, 3, Int64(event.kind))
 				try bind(insert, 4, event.author)
 				if let hTag = event.hTag { try bind(insert, 5, hTag) }
+				if let bTag = event.bTag { try bind(insert, 6, bTag) }
 				try stepDone(insert)
 			}
 		}
@@ -312,9 +416,10 @@ public actor SQLiteChangeStore: ChangeStore {
 		if let kinds = filter.kinds { list("kind", kinds.map { .integer(Int64($0)) }) }
 		if let authors = filter.authors { list("author", authors.map(Argument.text)) }
 		if let tags = filter.tagged["h"] { list("h", tags.map(Argument.text)) }
+		if let tags = filter.tagged["b"] { list("b", tags.map(Argument.text)) }
 		if let since = filter.since { clauses.append("created_at >= ?"); arguments.append(.integer(since)) }
 		if let until = filter.until { clauses.append("created_at <= ?"); arguments.append(.integer(until)) }
-		let select = try statement("SELECT id, created_at, kind, author, h FROM held" + (clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")))
+		let select = try statement("SELECT id, created_at, kind, author, h, b FROM held" + (clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")))
 		try reset(select)
 		for (index, argument) in arguments.enumerated() {
 			switch argument {
@@ -325,7 +430,8 @@ public actor SQLiteChangeStore: ChangeStore {
 		var events: [HeldEvent] = []
 		while try stepRow(select) {
 			let h = sqlite3_column_type(select, 4) == SQLITE_NULL ? nil : columnText(select, 4)
-			events.append(HeldEvent(id: columnText(select, 0), createdAt: sqlite3_column_int64(select, 1), kind: Int(sqlite3_column_int64(select, 2)), author: columnText(select, 3), hTag: h))
+			let b = sqlite3_column_type(select, 5) == SQLITE_NULL ? nil : columnText(select, 5)
+			events.append(HeldEvent(id: columnText(select, 0), createdAt: sqlite3_column_int64(select, 1), kind: Int(sqlite3_column_int64(select, 2)), author: columnText(select, 3), hTag: h, bTag: b))
 		}
 		sqlite3_reset(select)
 		return events
@@ -340,14 +446,19 @@ public actor SQLiteChangeStore: ChangeStore {
 		var hashes: [String: String] = [:]
 		while try stepRow(checkpoints) { hashes[columnText(checkpoints, 0)] = columnText(checkpoints, 1) }
 		sqlite3_reset(checkpoints)
+		let bases = try statement("SELECT object_id, hash FROM bases")
+		try reset(bases)
+		var baseHashes: [String: [String]] = [:]
+		while try stepRow(bases) { baseHashes[columnText(bases, 0), default: []].append(columnText(bases, 1)) }
+		sqlite3_reset(bases)
 		// The (object_id, seq) index yields each object's ids contiguously, in replay order.
-		let select = try statement("SELECT object_id, id FROM changes INDEXED BY changes_object_id ORDER BY object_id, seq")
+		let select = try statement("SELECT object_id, id FROM changes INDEXED BY changes_object_id WHERE rebased = 0 ORDER BY object_id, seq")
 		try reset(select)
 		var current: String?
 		var ids: [String] = []
 		func flush() {
 			guard let current else { return }
-			inputs[current] = ReplayInput(changeIds: ids, checkpointHash: hashes[current] ?? "")
+			inputs[current] = ReplayInput(changeIds: ids, checkpointHash: hashes[current] ?? "", baseHashes: baseHashes[current] ?? [])
 		}
 		while try stepRow(select) {
 			let objectId = columnText(select, 0)
@@ -360,21 +471,21 @@ public actor SQLiteChangeStore: ChangeStore {
 		}
 		flush()
 		sqlite3_reset(select)
-		for (objectId, hash) in hashes where inputs[objectId] == nil {
-			inputs[objectId] = ReplayInput(changeIds: [], checkpointHash: hash)
+		for objectId in Set(hashes.keys).union(baseHashes.keys) where inputs[objectId] == nil {
+			inputs[objectId] = ReplayInput(changeIds: [], checkpointHash: hashes[objectId] ?? "", baseHashes: baseHashes[objectId] ?? [])
 		}
 		return inputs
 	}
 
 	public func cachedReplays(objectIds: [String], engineVersion: String) async throws -> [String: CachedReplay] {
-		let select = try statement("SELECT change_count, change_digest, checkpoint_hash, state FROM replay_cache WHERE object_id = ? AND engine_version = ?")
+		let select = try statement("SELECT change_count, change_digest, checkpoint_hash, state, base_hashes FROM replay_cache WHERE object_id = ? AND engine_version = ?")
 		var rows: [String: CachedReplay] = [:]
 		for objectId in objectIds {
 			try reset(select)
 			try bind(select, 1, objectId)
 			try bind(select, 2, engineVersion)
 			if try stepRow(select) {
-				let input = ReplayInput(changeCount: Int(sqlite3_column_int64(select, 0)), changeDigest: columnText(select, 1), checkpointHash: columnText(select, 2))
+				let input = ReplayInput(changeCount: Int(sqlite3_column_int64(select, 0)), changeDigest: columnText(select, 1), checkpointHash: columnText(select, 2), baseHashes: columnText(select, 4))
 				rows[objectId] = CachedReplay(objectId: objectId, input: input, state: columnBlob(select, 3))
 			}
 		}
@@ -385,7 +496,7 @@ public actor SQLiteChangeStore: ChangeStore {
 	public func putCachedReplays(_ rows: [CachedReplay], engineVersion: String) async throws {
 		if rows.isEmpty { return }
 		try transaction {
-			let upsert = try statement("INSERT OR REPLACE INTO replay_cache (object_id, engine_version, change_count, change_digest, checkpoint_hash, state) VALUES (?, ?, ?, ?, ?, ?)")
+			let upsert = try statement("INSERT OR REPLACE INTO replay_cache (object_id, engine_version, change_count, change_digest, checkpoint_hash, state, base_hashes) VALUES (?, ?, ?, ?, ?, ?, ?)")
 			for row in rows {
 				try reset(upsert)
 				try bind(upsert, 1, row.objectId)
@@ -394,6 +505,7 @@ public actor SQLiteChangeStore: ChangeStore {
 				try bind(upsert, 4, row.input.changeDigest)
 				try bind(upsert, 5, row.input.checkpointHash)
 				try bind(upsert, 6, row.state)
+				try bind(upsert, 7, row.input.baseHashes)
 				try stepDone(upsert)
 			}
 		}
@@ -450,6 +562,20 @@ public actor SQLiteChangeStore: ChangeStore {
 			sqlite3_free(message)
 			throw StoreError(code: rc, message: text)
 		}
+	}
+
+	/// Adds `column` (declared `declaration`) to `table` unless the schema
+	/// already has it; an older build's rows keep their values.
+	private static func addColumn(_ db: OpaquePointer, table: String, column: String, _ declaration: String) throws {
+		var info: OpaquePointer?
+		guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table))", -1, &info, nil) == SQLITE_OK, let info else {
+			throw StoreError(code: sqlite3_errcode(db), message: String(cString: sqlite3_errmsg(db)))
+		}
+		defer { sqlite3_finalize(info) }
+		while sqlite3_step(info) == SQLITE_ROW {
+			if let name = sqlite3_column_text(info, 1), String(cString: name) == column { return }
+		}
+		try exec(db, "ALTER TABLE \(table) ADD COLUMN \(declaration)")
 	}
 
 	private func transaction<T>(_ body: () throws -> T) throws -> T {

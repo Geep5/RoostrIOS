@@ -206,6 +206,7 @@ actor InMemoryChangeStore: ChangeStore {
 	private var published: Set<String> = []
 	private var checkpoints: [String: CheckpointRecord] = [:]
 	private var held: [String: HeldEvent] = [:]
+	private var baseRecords: [String: [BaseRecord]] = [:]
 
 	func addChanges(_ records: [ChangeRecord]) async throws -> Int {
 		var added = 0
@@ -218,7 +219,28 @@ actor InMemoryChangeStore: ChangeStore {
 	}
 
 	func changesFor(objectId: String) async throws -> [ChangeRecord] { changes[objectId] ?? [] }
-	func objectIds() async throws -> [String] { Array(Set(changes.keys).union(checkpoints.keys)) }
+	func objectIds() async throws -> [String] { Array(Set(changes.keys).union(checkpoints.keys).union(baseRecords.keys)) }
+	func markRebased(_ marked: [String]) async throws {
+		let set = Set(marked)
+		for (objectId, records) in changes {
+			changes[objectId] = records.map { set.contains($0.id) ? ChangeRecord(id: $0.id, objectId: $0.objectId, bytes: $0.bytes, json: $0.json, b: $0.b, rebased: true) : $0 }
+		}
+	}
+
+	func putBase(_ record: BaseRecord) async throws -> Bool {
+		var held = baseRecords[record.objectId] ?? []
+		if held.contains(where: { $0.hash == record.hash }) { return false }
+		held.append(record)
+		let newest = held.map(\.epoch).max() ?? record.epoch
+		baseRecords[record.objectId] = held.filter { $0.epoch > newest - baseChainKept }
+		return true
+	}
+	func bases(objectId: String) async throws -> [BaseRecord] { baseRecords[objectId] ?? [] }
+	func currentBaseHashes() async throws -> [String] {
+		baseRecords.values.compactMap { $0.max { $1.outranks($0) }?.hash }.sorted()
+	}
+	func newestBaseCreatedAt() async throws -> Int64? { baseRecords.values.flatMap { $0 }.map(\.createdAt).max() }
+	func objectsWithoutBase() async throws -> [String] { changes.keys.filter { baseRecords[$0] == nil }.sorted() }
 
 	func checkpoint(objectId: String) async throws -> CheckpointRecord? { checkpoints[objectId] }
 	func putCheckpoint(_ record: CheckpointRecord) async throws -> Bool {
@@ -257,6 +279,7 @@ actor InMemoryChangeStore: ChangeStore {
 			if let kinds = filter.kinds, !kinds.contains(event.kind) { return false }
 			if let authors = filter.authors, !authors.contains(event.author) { return false }
 			if let tags = filter.tagged["h"], !tags.contains(event.hTag ?? "") { return false }
+			if let tags = filter.tagged["b"], !tags.contains(event.bTag ?? "") { return false }
 			if let since = filter.since, event.createdAt < since { return false }
 			if let until = filter.until, event.createdAt > until { return false }
 			return true

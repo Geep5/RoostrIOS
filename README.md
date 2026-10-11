@@ -14,11 +14,11 @@ SPA in a `WKWebView`, talking to the Swift backend over a message bridge.
 Vendor/Glon.xcframework   Odin engine: ios-arm64, ios-arm64-simulator, macos-arm64 static slices
 Vendor/glon-core.json     compiler + sha256 of every Odin source the framework was built from
 Sources/GlonCore/         GlonCore actor: single-flight JSON ABI over the static library
-Sources/RoostrSync/       Host for the engine: Contracts (shared types), Nostr keys/signing, Relay (NIP-01 + NIP-77 WebSocket; a 25 s ping keepalive fails a socket whose pong misses 10 s), Negentropy (set reconciliation protocol V1, byte-exact with hoytech/negentropy), SQLiteChangeStore (changes, one checkpoint per object, meta, held relay events, replay cache), Identity (Keychain), SyncEngine (session + outbox loop; history by NIP-77 reconciliation of the events this device holds, checkpoints first, needed ids fetched in batches of 100, falling back to the paged kind-1078/1079 walk when a relay answers NEG-ERR / NOTICE / nothing; kind-30079 manifests are obsolete and never read, and a floor an older build stored is forgotten at start so that device walks from zero once; personal, shared-space and gift-wrap subscriptions; docs/checkpoint-sync.md in glonOdin), Backend (objects/mutations the UI consumes; replayed states restored from the replay cache), Backend+Spaces (keyring reconcile, NIP-59 invites and join requests, channels), SpaceKeyring (space keys in the Keychain, `app.roostr.space-keys`), GiftWrap (NIP-59 seal/wrap/unwrap, byte-compatible with nostr-tools), Backend+Projections (website-shaped lists/relations/query/digest), WebBridge (JS ⇄ Swift message bridge + roostr:// scheme handler)
+Sources/RoostrSync/       Host for the engine: Contracts (shared types), Nostr keys/signing, Relay (NIP-01 + NIP-77 WebSocket; a 25 s ping keepalive fails a socket whose pong misses 10 s), Negentropy (set reconciliation protocol V1, byte-exact with hoytech/negentropy), SQLiteChangeStore (changes with the base their event named and the rebased mark, one checkpoint per object, bases, meta, held relay events, replay cache; older schemas migrate in place), Identity (Keychain), SyncEngine (session + outbox loop; bases first, then live deltas by the bases they name, see State sync below; history by NIP-77 reconciliation of the events this device holds, checkpoints first, needed ids fetched in batches of 100, falling back to the paged walk when a relay answers NEG-ERR / NOTICE / nothing; kind-30079 manifests are obsolete and never read, and a floor an older build stored is forgotten at start so that device walks from zero once; personal, shared-space and gift-wrap subscriptions; docs/checkpoint-sync.md and docs/state-sync.md in glonOdin), Backend (objects/mutations the UI consumes; states replayed from base, replayed states restored from the replay cache, orphans rebased), Backend+Spaces (keyring reconcile, NIP-59 invites and join requests, channels), SpaceKeyring (space keys in the Keychain, `app.roostr.space-keys`), GiftWrap (NIP-59 seal/wrap/unwrap, byte-compatible with nostr-tools), Backend+Projections (website-shaped lists/relations/query/digest), WebBridge (JS ⇄ Swift message bridge + roostr:// scheme handler; `signEvent` signs Blossom authorizations only)
 Sources/RoostrUI/         SwiftUI shell shared by both platforms: AppModel, identity gate, WebEditorView (the website in a WKWebView), RoostrApp scene
 Sources/RoostrMac/        macOS runner (`roostr-mac`) for the same UI without a simulator
 Tests/GlonCoreTests/      golden fixtures shared with glonOdin/core and the website: codec_fixtures.json (protobuf codec, content addressing), wire_fixtures.json (NIP-44, blinded tags, sealing, address verification), authority_fixtures.json (shared-space authority gate, vanish ledger); SyncSessionTests mirrors glonOdin/core/sync_session_test.odin (receive-side reassembly, cursor, replay bookkeeping; outbox order, dedupe, rotated-key rule, backoff, wake and sealing on first send) with events sealed by the engine itself
-Tests/RoostrSyncTests/    host tests: signing/verify against nostr-tools fixtures, store, relay, sync loop; NegentropyTests replays transcripts of the hoytech JS reference (Fixtures/negentropy_vectors.json) byte for byte; NegentropySyncTests (only missing ids fetched, completion waits for every one, NEG-ERR falls back to the walk); QueryCacheTests (a block-heavy vault queries and re-opens within the core's query cache: compact cached state, 2 MiB query batches, reset frees the old snapshot first); CheckpointSyncTests (supersede rule, checkpoint-seeded replay, cold start ignoring kind-30079 manifests and forgetting a legacy floor, live checkpoint re-keying the replay memo); ReplayCacheTests (a warm start serves fresh-replay-identical states without replaying; a new change, checkpoint or engine version invalidates a row; rebuild and logout clear it); SharedSpacesTests drives owner/member/viewer backends through one in-memory relay (join request → invite wrap → key import → space backfill → authority gate → key rotation) and opens a nostr-tools gift wrap (Fixtures/nip59_fixture.json)
+Tests/RoostrSyncTests/    host tests: signing/verify against nostr-tools fixtures, store, relay, sync loop; NegentropyTests replays transcripts of the hoytech JS reference (Fixtures/negentropy_vectors.json) byte for byte; NegentropySyncTests (only missing ids fetched, completion waits for every one, NEG-ERR falls back to the walk); QueryCacheTests (a block-heavy vault queries and re-opens within the core's query cache: compact cached state, 2 MiB query batches, reset frees the old snapshot first); CheckpointSyncTests (supersede rule, checkpoint-seeded replay, cold start ignoring kind-30079 manifests and forgetting a legacy floor, live checkpoint re-keying the replay memo); StateSyncTests (bases-first bootstrap of a split base reaches the full-history state without fetching folded history, a local delta carries its base's b tag, an orphan rebases to the same id on two devices, no bases keeps the pre-base walk, schema migration keeps every row, bounded base chain); ReplayCacheTests (a warm start serves fresh-replay-identical states without replaying; a new change, checkpoint or engine version invalidates a row; rebuild and logout clear it); SharedSpacesTests drives owner/member/viewer backends through one in-memory relay (join request → invite wrap → key import → space backfill → authority gate → key rotation) and opens a nostr-tools gift wrap (Fixtures/nip59_fixture.json)
 App/                      iOS entry (`RoostrIOSApp`), project generated by XcodeGen from project.yml; App/Web is the website build (folder reference, see below)
 ```
 
@@ -87,11 +87,44 @@ The editor opens as soon as the identity is read: `AppModel` constructs the
 live subscriptions, then `bootstrap_space_defaults`) behind it, while bridge
 reads serve the local replica at once and the page's sync status covers the
 catch-up. Replayed states persist in the store's `replay_cache` table, one row
-per object keyed on a digest of its change ids in replay order, its checkpoint
-hash and the engine fingerprint; a cold start replays only objects whose row
-no longer matches, and writes fresh rows in batches behind it.
+per object keyed on a digest of its change ids in replay order (rebased
+orphans left out), its checkpoint hash, the hashes of the bases it holds and
+the engine fingerprint; a cold start replays only objects whose row no longer
+matches, and writes fresh rows in batches behind it.
 `Backend.rebuildLocalStates()` drops the cache and replays everything; logout
 clears it.
+
+## State sync
+
+glonOdin `docs/state-sync.md`; the core owns every rule (`classify`,
+`replay_from_base`, `rebase`, base sealing and ingest), the phone never
+compacts. Every history pass:
+
+1. **Bases first**: NIP-77 on `{kinds:[31078], authors:[me]}` and each space
+   stream (`#h`); a split base brings its kind-1080 parts by `#c`. Bases are
+   kept per object (the newest 8 epochs); objects render from them at once.
+2. **Dual read**: while no base is held the pass is exactly the pre-base one
+   (every kind-1079 checkpoint, the whole kind-1078 history). Once bases
+   exist: deltas by `{kinds:[1078], #b:[current base hashes]}` in batches of
+   100, deltas of objects held with no base by their personal `#h` tag, and
+   everything since the newest base's `created_at` minus a day (personal,
+   space streams, checkpoints); a space's stream deletion stays unbounded.
+   Kind-1078 history is never walked from event zero again.
+3. **Live** subscriptions carry kinds 1078, 1079, 31078, 1080 (and 5 on space streams).
+
+An object's state is `replay_from_base` over its bases, its changes (with the
+`b` their events carried) and its legacy checkpoint. A local change on an
+object with a base names the live heads (plus base heads nothing live built
+on) as parents and goes out with `["b", base]`. When an import touches an
+object, held deltas the core classifies as orphans are rebased onto the
+current base (personal objects and spaces this identity administers; another
+owner's space only as a writer), stored, published with the new base's `b`,
+and marked rebased so they never replay again; a still-pending orphan's own
+publication is dropped. Rebased ids are deterministic across devices.
+
+The web layer has no key on iOS: the bridge's `signEvent({kind, created_at,
+tags, content})` signs kind-24242 Blossom authorizations with the identity
+key and refuses every other kind.
 
 ## Verify
 

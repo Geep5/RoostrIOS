@@ -141,7 +141,7 @@ final class SyncEngineTests: XCTestCase {
 		let live = try XCTUnwrap(relay.subscribeFilters.last { $0.authors != nil })
 		XCTAssertEqual(live.since, cursor + 1)
 		XCTAssertEqual(live.authors, [key.pubkey])
-		XCTAssertEqual(live.kinds, [1078, 1079], "live carries changes and checkpoints")
+		XCTAssertEqual(live.kinds, [1078, 1079, 31078, 1080], "live carries changes, checkpoints, bases and base parts")
 		let reconciled = try XCTUnwrap(relay.reconcileFilters.last { $0.authors != nil && $0.kinds == [1078] })
 		XCTAssertNil(reconciled.since, "a restart reconciles the whole stream, not from the cursor")
 		XCTAssertEqual(relay.fetchedIds.count, fetchedBefore, "everything is held: the restart fetches nothing")

@@ -46,14 +46,18 @@ private struct SharedSpace: Sendable, Equatable {
 	let spaceTag: String
 }
 
-/// One decrypted relay payload: a change (kind 1078) or a checkpoint (kind 1079).
+/// One decrypted relay payload: a change (kind 1078), a checkpoint (kind 1079)
+/// or a base (kind 31078, its parts kind 1080).
 private struct ImportItem: Sendable {
 	let objectId: String
 	let bytes: Data
-	/// `bytes` as the core handed them over; the checkpoint gate takes them back verbatim.
+	/// `bytes` as the core handed them over; the checkpoint and base gates take them back verbatim.
 	let base64: String
 	let change: JSONValue?
+	/// The base a change's event named.
+	let b: String?
 	let checkpoint: CheckpointSummary?
+	let base: BaseSummary?
 	let chunkKey: String?
 	let provenance: SharedProvenance?
 	/// The relay events this item was read from: held once it imports.
@@ -85,6 +89,12 @@ public actor SyncEngine {
 	/// to ~40k chars, so 100 stay well inside the relay's 8 MiB response budget.
 	private static let fetchBatch = 100
 	private static let checkpointFetchBatch = 8
+	/// Base hashes / object tags per `#b` / `#h` filter of the live-delta pass.
+	private static let tagBatch = 100
+	/// The bounded fallback reaches this far before the newest base (docs/state-sync.md "Sync on a device").
+	private static let baseLookbackSeconds: Int64 = 86_400
+	/// Relay kinds the session ingests.
+	private static let syncedKinds: Set<Int> = [Engine.changeKind, Engine.checkpointKind, Engine.baseKind, Engine.basePartKind, Engine.deletionKind]
 	private static let walkRetryDelay: Duration = .seconds(30)
 	private static let pageSpacing: Duration = .milliseconds(400)
 	private static let publishSpacing: Duration = .milliseconds(120)
@@ -109,7 +119,7 @@ public actor SyncEngine {
 	private var historyComplete = false
 	/// Why the last history walk stopped short ("" once one completes); shown in the status detail.
 	private var lastWalkFailure = ""
-	/// The checkpoint pass of a walk has run: every object has its cached state, history is still streaming in.
+	/// The bases and checkpoints pass of a walk has run: every object has its state, deltas/history are still streaming in.
 	private var checkpointsLoaded = false
 	private var walkRetry: Task<Void, Never>?
 	private var walkCoveredUntil: Int64?
@@ -121,6 +131,7 @@ public actor SyncEngine {
 	private var activeImports = 0
 	private var importedCount = 0
 	private var checkpointCount = 0
+	private var baseCount = 0
 	/// Mirror of the outbox's queued-not-in-flight count, for the status.
 	private var pendingCount = 0
 	private var queueRunning = false
@@ -375,7 +386,7 @@ public actor SyncEngine {
 
 	private func statusDetail() -> String? {
 		if historyComplete { return nil }
-		let progress = "\(importedCount) changes\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
+		let progress = "\(importedCount) changes\(baseCount > 0 ? ", \(baseCount) bases" : "")\(checkpointCount > 0 ? ", \(checkpointCount) checkpoints" : "") so far"
 		if lastWalkFailure.isEmpty { return checkpointsLoaded ? "verifying full history · \(progress)" : "loading spaces · \(progress)" }
 		return "history incomplete, retrying · \(progress) · \(lastWalkFailure)"
 	}
@@ -467,50 +478,60 @@ public actor SyncEngine {
 		await persistCursor()
 
 		let full = since <= 1
-		// Checkpoints are walked to the end FIRST: every object renders from its
-		// cache within a few pages, then the change history streams in behind
-		// (docs/checkpoint-sync.md - a checkpoint never shortens the history).
-		// A reconciliation always covers a stream's whole set, so its filter
-		// takes the full walk's bounds whatever `since` an incremental walk uses.
-		var checkpointStreams = [HistoryStream(
-			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind]),
-			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since)
-		)]
-		var changeStreams = [HistoryStream(
-			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind]),
-			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)
-		)]
-		for space in spaces.values {
-			let tagged = ["h": [space.spaceTag]]
-			changeStreams.append(HistoryStream(
-				reconcile: NostrFilter(kinds: [Engine.changeKind], tagged: tagged),
-				walk: NostrFilter(kinds: [Engine.changeKind], since: since, tagged: tagged)
-			))
-			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
-			checkpointStreams.append(HistoryStream(
-				reconcile: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], tagged: tagged),
-				walk: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: tagged)
-			))
-		}
 		// Imported batch by batch, never buffered until the pass ends: a phone
 		// that locks or suspends mid-walk keeps every page it fetched, and
 		// spaces appear as their history lands (lib/engine/sync.ts walkHistory).
-		// The checkpoint pass is short and re-walked whole on every resume, so
-		// it neither starts from nor moves the bootstrap floor, which belongs
-		// to the change walk alone.
+		// A reconciliation always covers a stream's whole set, so its filter
+		// takes the full walk's bounds whatever `since` an incremental walk uses.
 		var complete = !relays.isEmpty
-		for (streams, resume, track) in [(checkpointStreams, nil as Int64?, false), (changeStreams, resumeUntil, trackFloor)] {
+		func pass(_ streams: [HistoryStream], resumeUntil resume: Int64?, trackFloor track: Bool) async throws {
 			try await withThrowingTaskGroup(of: Bool.self) { group in
 				for relay in relays {
 					group.addTask { try await self.syncRelay(relay, streams: streams, resumeUntil: resume, trackFloor: track) }
 				}
 				for try await relayComplete in group where !relayComplete { complete = false }
 			}
-			if !checkpointsLoaded {
-				checkpointsLoaded = true
-				emitLiveStatus()
-			}
 		}
+
+		// Bases FIRST (docs/state-sync.md "Sync on a device"): every object
+		// renders from its base as soon as it lands. Addressable, so the set
+		// is one event per object; split ones bring their 1080 parts by #c.
+		var baseStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.baseKind]),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.baseKind], since: since)
+		)]
+		for space in spaces.values {
+			let tagged = ["h": [space.spaceTag]]
+			baseStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.baseKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.baseKind], since: since, tagged: tagged)
+			))
+		}
+		try await pass(baseStreams, resumeUntil: nil, trackFloor: false)
+
+		// Dual read: with no base on any relay (a vault no computer has
+		// compacted yet) the walk is exactly the pre-base one; once bases
+		// exist, deltas come by the bases they name and history walks are
+		// bounded to the newest base minus a day - never from event zero.
+		let (checkpointStreams, changeStreams): ([HistoryStream], [HistoryStream])
+		if let newest = try await store.newestBaseCreatedAt() {
+			// A chunked change still assembling needs its older parts: its group lowers the bound.
+			let bound = min(max(0, newest / 1000 - Self.baseLookbackSeconds), replayGroups.values.min() ?? Int64.max)
+			(checkpointStreams, changeStreams) = try await boundedStreams(since: since, bound: bound)
+		} else {
+			(checkpointStreams, changeStreams) = legacyStreams(since: since)
+		}
+		// Checkpoints are walked to the end before the changes: every object
+		// renders from its cache within a few pages, then the change history
+		// streams in behind (docs/checkpoint-sync.md). The checkpoint pass is
+		// short and re-walked whole on every resume, so it neither starts from
+		// nor moves the bootstrap floor, which belongs to the change walk alone.
+		try await pass(checkpointStreams, resumeUntil: nil, trackFloor: false)
+		if !checkpointsLoaded {
+			checkpointsLoaded = true
+			emitLiveStatus()
+		}
+		try await pass(changeStreams, resumeUntil: resumeUntil, trackFloor: trackFloor)
 		// Every relay answered for every filter and nothing faulted: a
 		// CHECKPOINT group still open is missing parts no relay holds (NIP-09
 		// took a superseded checkpoint's chunks; the newer one covers the
@@ -538,6 +559,89 @@ public actor SyncEngine {
 			await persistCursor()
 		}
 		return historyComplete
+	}
+
+	/// The pre-base walk, unchanged: every kind-1079 checkpoint and the whole
+	/// kind-1078 history of this identity and of every installed space.
+	private func legacyStreams(since: Int64) -> (checkpoints: [HistoryStream], changes: [HistoryStream]) {
+		var checkpointStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind]),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: since)
+		)]
+		var changeStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind]),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since)
+		)]
+		for space in spaces.values {
+			let tagged = ["h": [space.spaceTag]]
+			changeStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.changeKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.changeKind], since: since, tagged: tagged)
+			))
+			// The administrator's stream deletion travels with the checkpoints: unbounded on a full walk.
+			checkpointStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.checkpointKind, Engine.deletionKind], since: since, tagged: tagged)
+			))
+		}
+		return (checkpointStreams, changeStreams)
+	}
+
+	/// The walk once bases exist. Deltas of held bases by `#b` (any author:
+	/// space members write on the same bases), deltas of objects held with
+	/// no base by their personal `#h` stream tag, and everything newer than
+	/// `bound` (new objects, deltas on a base this device lacks, pre-upgrade
+	/// writers) by author and by space stream. Legacy checkpoints keep
+	/// importing within the bound; a space's stream deletion stays unbounded.
+	private func boundedStreams(since: Int64, bound: Int64) async throws -> (checkpoints: [HistoryStream], changes: [HistoryStream]) {
+		let walkSince = max(since, bound)
+		var checkpointStreams = [HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: bound),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.checkpointKind], since: walkSince)
+		)]
+		var changeStreams: [HistoryStream] = []
+		for batch in Self.batches(try await store.currentBaseHashes(), Self.tagBatch) {
+			let tagged = ["b": batch]
+			changeStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.changeKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.changeKind], since: since, tagged: tagged)
+			))
+		}
+		var objectTags: [String] = []
+		for objectId in try await store.objectsWithoutBase() {
+			objectTags.append(try await Engine.blind(secretHex: key.secretHex, id: objectId))
+		}
+		for batch in Self.batches(objectTags, Self.tagBatch) {
+			let tagged = ["h": batch]
+			changeStreams.append(HistoryStream(
+				reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], tagged: tagged),
+				walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: since, tagged: tagged)
+			))
+		}
+		changeStreams.append(HistoryStream(
+			reconcile: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: bound),
+			walk: NostrFilter(authors: [pk], kinds: [Engine.changeKind], since: walkSince)
+		))
+		for space in spaces.values {
+			let tagged = ["h": [space.spaceTag]]
+			changeStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.changeKind], since: bound, tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.changeKind], since: walkSince, tagged: tagged)
+			))
+			checkpointStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.checkpointKind], since: bound, tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.checkpointKind], since: walkSince, tagged: tagged)
+			))
+			checkpointStreams.append(HistoryStream(
+				reconcile: NostrFilter(kinds: [Engine.deletionKind], tagged: tagged),
+				walk: NostrFilter(kinds: [Engine.deletionKind], since: since, tagged: tagged)
+			))
+		}
+		return (checkpointStreams, changeStreams)
+	}
+
+	private static func batches(_ items: [String], _ size: Int) -> [[String]] {
+		stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
 	}
 
 	/// Reconciles `streams` with `relay` one at a time (the relay caps NIP-77
@@ -584,18 +688,21 @@ public actor SyncEngine {
 			return .incomplete
 		}
 		var complete = true
-		// Checkpoint events run to ~40k chars each: 100 per REQ is a multi-MB
-		// burst that a slow phone link cannot drain before the relay's send
-		// deadline, so the socket drops and the same batch fails forever.
-		let batchSize = filter.kinds?.contains(Engine.checkpointKind) == true ? Self.checkpointFetchBatch : Self.fetchBatch
+		// Checkpoint and base events run to ~40k chars each: 100 per REQ is a
+		// multi-MB burst that a slow phone link cannot drain before the relay's
+		// send deadline, so the socket drops and the same batch fails forever.
+		let large = filter.kinds?.contains(where: { $0 == Engine.checkpointKind || $0 == Engine.baseKind }) == true
+		let batchSize = large ? Self.checkpointFetchBatch : Self.fetchBatch
 		for start in stride(from: 0, to: need.count, by: batchSize) {
 			if stopped { return .incomplete }
 			if start > 0 { try await Task.sleep(for: Self.pageSpacing) }
 			let ids = Array(need[start..<min(start + batchSize, need.count)])
 			let wanted = Set(ids)
 			let batch: [NostrEvent]
+			let parts: [NostrEvent]
 			do {
 				batch = try await relay.query([NostrFilter(ids: ids)], timeout: Self.queryTimeout).filter { wanted.contains($0.id) }
+				parts = try await baseParts(of: batch, from: relay)
 			} catch {
 				lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
 				return .incomplete
@@ -605,7 +712,7 @@ public actor SyncEngine {
 				complete = false
 				lastWalkFailure = "\(relay.url): \(missing) reconciled events not returned"
 			}
-			try await importEvents(batch)
+			try await importEvents(parts + batch)
 		}
 		return complete ? .complete : .incomplete
 	}
@@ -621,14 +728,16 @@ public actor SyncEngine {
 			page.until = until
 			page.limit = Self.pageLimit
 			let batch: [NostrEvent]
+			let parts: [NostrEvent]
 			do {
 				batch = try await relay.query([page], timeout: Self.queryTimeout)
 				if batch.count == Self.pageLimit, let until, batch.lazy.map(\.created_at).min()! >= until { throw SyncError.saturatedPage }
+				parts = try await baseParts(of: batch, from: relay)
 			} catch {
 				lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
 				return false
 			}
-			try await importEvents(batch)
+			try await importEvents(parts + batch)
 			if batch.count < Self.pageLimit { return true }
 			let oldest = batch.lazy.map(\.created_at).min()!
 			until = oldest
@@ -639,6 +748,26 @@ public actor SyncEngine {
 			}
 			try await Task.sleep(for: Self.pageSpacing)
 		}
+	}
+
+	/// The kind-1080 parts of every split base in `events` (`#c` = its group
+	/// id): published before the 31078, so a relay holding the base holds them.
+	private func baseParts(of events: [NostrEvent], from relay: RelayClient) async throws -> [NostrEvent] {
+		let gids = Self.splitBaseGroups(events)
+		var parts: [NostrEvent] = []
+		for batch in Self.batches(gids, Self.tagBatch) {
+			parts += try await relay.query([NostrFilter(kinds: [Engine.basePartKind], tagged: ["c": batch])], timeout: Self.queryTimeout)
+		}
+		return parts
+	}
+
+	/// Group ids of the split bases among `events`: a 31078 whose `c` tag says more than one part.
+	private static func splitBaseGroups(_ events: [NostrEvent]) -> [String] {
+		var gids: Set<String> = []
+		for event in events where event.kind == Engine.baseKind {
+			if let chunk = event.tags.first(where: { $0.first == "c" && $0.count > 3 }), (Int(chunk[3]) ?? 0) > 1 { gids.insert(chunk[1]) }
+		}
+		return gids.sorted()
 	}
 
 	/// Ingests and imports one fetched batch, then reports progress.
@@ -671,7 +800,7 @@ public actor SyncEngine {
 	/// An event the session consumed cleanly becomes held: with its item once
 	/// that imports, with its group's item for a chunk part, else at once.
 	private func ingest(_ event: NostrEvent) async throws -> ImportItem? {
-		guard event.kind == Engine.changeKind || event.kind == Engine.checkpointKind || event.kind == Engine.deletionKind, NostrKey.verify(event) else { return nil }
+		guard Self.syncedKinds.contains(event.kind), NostrKey.verify(event) else { return nil }
 		guard sessionOpen else { return nil } // stopped or retired
 		let r: IngestResult = try await Engine.sync("ingest", ["event": Self.eventJSON(event), "nowMs": .int(Self.nowMs())])
 		cursor = r.cursor
@@ -681,7 +810,9 @@ public actor SyncEngine {
 			for sink in spaceVanishSinks.values { sink.yield(spaceId) }
 		}
 		let held = HeldEvent(event)
-		let group = event.tags.first { $0.first == "c" && $0.count > 1 }.map { "\(event.pubkey)/\(event.kind)/\($0[1])" }
+		// A base's 31078 event and its 1080 parts form one group, as in the session.
+		let groupKind = event.kind == Engine.basePartKind ? Engine.baseKind : event.kind
+		let group = event.tags.first { $0.first == "c" && $0.count > 1 }.map { "\(event.pubkey)/\(groupKind)/\($0[1])" }
 		guard let item = r.item else {
 			if r.faultAt == nil && r.decryptFailure != true && r.decodeFailure != true {
 				if let group { heldParts[group, default: []].append(held) } else { try await store.recordHeld([held]) }
@@ -691,10 +822,11 @@ public actor SyncEngine {
 		guard let bytes = Data(base64Encoded: item.bytes) else { throw SyncError.malformedChange }
 		let objectId: String
 		if let checkpoint = item.checkpoint { objectId = checkpoint.objectId }
+		else if let base = item.base { objectId = base.objectId }
 		else if let id = item.change?["objectId"]?.string { objectId = id }
 		else { throw SyncError.malformedChange }
 		let parts = group.flatMap { heldParts.removeValue(forKey: $0) } ?? []
-		return ImportItem(objectId: objectId, bytes: bytes, base64: item.bytes, change: item.change, checkpoint: item.checkpoint, chunkKey: item.chunkKey, provenance: item.provenance, held: parts + [held])
+		return ImportItem(objectId: objectId, bytes: bytes, base64: item.bytes, change: item.change, b: item.b, checkpoint: item.checkpoint, base: item.base, chunkKey: item.chunkKey, provenance: item.provenance, held: parts + [held])
 	}
 
 	/// Report a reassembled group's import outcome to the session.
@@ -749,7 +881,7 @@ public actor SyncEngine {
 		return failure
 	}
 
-	/// Stores one change or checkpoint unless the authority gate refuses it (false).
+	/// Stores one change, checkpoint or base unless the authority gate refuses it (false).
 	private func importOne(_ item: ImportItem, settled: inout Set<String>) async throws -> Bool {
 		if let provenance = item.provenance, !(try await authorized(item, provenance)) { return false }
 		if let checkpoint = item.checkpoint {
@@ -761,9 +893,16 @@ public actor SyncEngine {
 				checkpointCount += 1
 				pendingObjects.insert(item.objectId)
 			}
+		} else if let base = item.base {
+			// Every base is kept (bounded per object): the core picks the
+			// current one, and older ones make more orphans decidable.
+			if try await store.putBase(BaseRecord(objectId: item.objectId, hash: base.hash, epoch: base.epoch, createdAt: base.createdAt, bytes: item.bytes)) {
+				baseCount += 1
+				pendingObjects.insert(item.objectId)
+			}
 		} else {
 			guard let change = item.change, let id = change["id"]?.string else { throw SyncError.malformedChange }
-			importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: item.objectId, bytes: item.bytes, json: change)])
+			importedCount += try await store.addChanges([ChangeRecord(id: id, objectId: item.objectId, bytes: item.bytes, json: change, b: item.b)])
 			let publishKey = item.provenance.map { "\($0.spaceId)/\($0.keyId)/\(id)" } ?? id
 			try await store.markPublished(key: publishKey)
 			pendingObjects.insert(item.objectId)
@@ -777,8 +916,8 @@ public actor SyncEngine {
 	}
 
 	/// The installed key version and its administrator (the keyring's owner,
-	/// else this identity) decide; a rotated keyId is refused. A checkpoint
-	/// bypasses per-op authority, so only the space owner may publish one.
+	/// else this identity) decide; a rotated keyId is refused. A checkpoint or
+	/// base bypasses per-op authority, so only the space owner may publish one.
 	private func authorized(_ item: ImportItem, _ provenance: SharedProvenance) async throws -> Bool {
 		guard let space = spaces[provenance.spaceId]?.info else { return false }
 		let trustedSpace = try await replayStored(provenance.spaceId)
@@ -789,16 +928,30 @@ public actor SyncEngine {
 			"trustedSpace": trustedSpace ?? .null,
 			"existing": existing ?? .null,
 		]
-		if item.checkpoint != nil { payload["checkpoint"] = .string(item.base64) } else { payload["change"] = item.change ?? .null }
-		let verdict: AuthorizeResult = try await Engine.sync(item.checkpoint != nil ? "authorizeCheckpoint" : "authorize", payload)
+		let action: String
+		if item.checkpoint != nil {
+			action = "authorizeCheckpoint"
+			payload["checkpoint"] = .string(item.base64)
+		} else if item.base != nil {
+			action = "authorizeBase"
+			payload["base"] = .string(item.base64)
+		} else {
+			action = "authorize"
+			payload["change"] = item.change ?? .null
+		}
+		let verdict: AuthorizeResult = try await Engine.sync(action, payload)
 		return verdict.ok
 	}
 
-	/// Current state of a stored object: its checkpoint (if any) plus the tail.
+	/// Current state of a stored object, as the backend replays it (`replay_from_base`).
 	private func replayStored(_ objectId: String) async throws -> JSONValue? {
-		let changes = try await store.changesFor(objectId: objectId).map(\.json)
-		let checkpoint = try await store.checkpoint(objectId: objectId)
-		return try await Engine.replay(changes, checkpoint: checkpoint?.bytes)
+		try await Engine.replayFromBase(try await ObjectHoldings.load(store, objectId: objectId))
+	}
+
+	/// True when this identity may author in the installed space `spaceId`
+	/// (owner or writer member): only then does it rebase that space's orphans.
+	public func mayWrite(spaceId: String) -> Bool {
+		spaces[spaceId]?.info.writers.contains(pk) ?? false
 	}
 
 	private func recordReplayFault(_ at: Int64) async {
@@ -850,10 +1003,11 @@ public actor SyncEngine {
 		liveUp = true
 	}
 
-	/// Personal changes and checkpoints, every installed space's stream (with
-	/// its administrator's stream deletion), and gift wraps for us.
+	/// Personal changes, checkpoints and bases (with their parts), every
+	/// installed space's stream (with its administrator's stream deletion),
+	/// and gift wraps for us.
 	private func liveFilters(since: Int64, spaceTags: [String]) -> [NostrFilter] {
-		let kinds = [Engine.changeKind, Engine.checkpointKind]
+		let kinds = [Engine.changeKind, Engine.checkpointKind, Engine.baseKind, Engine.basePartKind]
 		var filters = [NostrFilter(authors: [pk], kinds: kinds, since: since)]
 		if !spaceTags.isEmpty { filters.append(NostrFilter(kinds: kinds + [Engine.deletionKind], since: since, tagged: ["h": spaceTags])) }
 		filters.append(NostrFilter(kinds: [giftWrapKind], since: Int64(Date().timeIntervalSince1970) - wrapLookbackSeconds, tagged: ["p": [pk]]))
@@ -969,7 +1123,15 @@ public actor SyncEngine {
 	private func handleLiveEvent(_ event: NostrEvent) async {
 		activeLiveEvents += 1
 		do {
-			if let item = try await ingest(event) { try await importBatch([item], immediateNotify: false) }
+			// A split base's parts went out before it, possibly before this
+			// subscription: fetch them so the group completes now.
+			let gids = Self.splitBaseGroups([event])
+			let parts = gids.isEmpty ? [] : await query([NostrFilter(kinds: [Engine.basePartKind], tagged: ["c": gids])], timeout: Self.queryTimeout)
+			var items: [ImportItem] = []
+			for incoming in parts.sorted(by: { $0.id < $1.id }) + [event] {
+				if let item = try await ingest(incoming) { items.append(item) }
+			}
+			try await importBatch(items, immediateNotify: false)
 		} catch {
 			await recordReplayFault(1)
 			emit(SyncStatus(phase: .error, imported: importedCount, pending: pendingCount, detail: "\(error)"))
@@ -1005,11 +1167,12 @@ public actor SyncEngine {
 	/// (`key = changeId`) and, when `spaceId` names an installed space, the
 	/// shared one (`key = spaceId/keyId/changeId`) sealed under the space key.
 	/// `spaceId` is the object's `channel` field, or the object itself when it
-	/// is a channel; "" is personal only.
-	public func publish(bytes: Data, changeId: String, objectId: String, spaceId: String = "") async throws {
-		var candidates = [PendingPublish(key: changeId, objectId: objectId, changeId: changeId, bytes: bytes)]
+	/// is a channel; "" is personal only. `base` is the hash of the base the
+	/// change was written on: its events carry `["b", base]`.
+	public func publish(bytes: Data, changeId: String, objectId: String, spaceId: String = "", base: String? = nil) async throws {
+		var candidates = [PendingPublish(key: changeId, objectId: objectId, changeId: changeId, bytes: bytes, base: base)]
 		if let space = spaces[spaceId]?.info {
-			candidates.append(PendingPublish(key: "\(space.spaceId)/\(space.keyId)/\(changeId)", objectId: objectId, changeId: changeId, bytes: bytes, spaceId: space.spaceId, keyId: space.keyId))
+			candidates.append(PendingPublish(key: "\(space.spaceId)/\(space.keyId)/\(changeId)", objectId: objectId, changeId: changeId, bytes: bytes, spaceId: space.spaceId, keyId: space.keyId, base: base))
 		}
 		for item in candidates {
 			if try await store.isPublished(key: item.key) { continue }
@@ -1031,6 +1194,7 @@ public actor SyncEngine {
 		]
 		if let spaceId = pending.spaceId { record["spaceId"] = .string(spaceId) }
 		if let keyId = pending.keyId { record["keyId"] = .int(keyId) }
+		if let base = pending.base { record["base"] = .string(base) }
 		let r: EnqueueResult = try await Engine.sync("outbox_enqueue", ["pending": .object(record)])
 		pendingCount = r.pending
 		guard r.queued else { return }

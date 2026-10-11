@@ -43,14 +43,106 @@ public struct CheckpointSummary: Decodable, Sendable, Equatable {
 	public let hash: String
 }
 
-/// One decrypted relay payload: a change (kind 1078) or a checkpoint (kind 1079).
+/// A reassembled kind-31078 base as the session summarizes it (bytes stay opaque).
+public struct BaseSummary: Decodable, Sendable, Equatable {
+	public let objectId: String
+	public let hash: String
+	public let epoch: Int64
+	public let createdAt: Int64
+	public let headIds: [String]
+	public let covered: Int
+}
+
+/// One decrypted relay payload: a change (kind 1078), a checkpoint (kind 1079) or a base (kind 31078 + 1080 parts).
 public struct IngestItem: Decodable, Sendable {
-	/// Base64 wire bytes of the full change or checkpoint.
+	/// Base64 wire bytes of the full change, checkpoint or base.
 	public let bytes: String
 	public let change: JSONValue?
+	/// The base hash a change's event named (`["b", hash]`); nil = pre-migration.
+	public let b: String?
 	public let checkpoint: CheckpointSummary?
+	public let base: BaseSummary?
 	public let chunkKey: String?
 	public let provenance: SharedProvenance?
+}
+
+/// `classify`: how each held change relates to the object's current base (hex id lists).
+public struct BaseClassification: Decodable, Sendable, Equatable {
+	public struct Current: Decodable, Sendable, Equatable {
+		public let hash: String
+		public let epoch: Int64
+	}
+
+	/// nil: no base, every change is live.
+	public let base: Current?
+	public let live: [String]
+	public let covered: [String]
+	public let premigrationCovered: [String]
+	public let orphan: [String]
+	public let stale: [String]
+	public let liveHeads: [String]
+}
+
+/// `rebase`: the orphans re-applied on the current base, in publish order.
+public struct RebaseResult: Decodable, Sendable {
+	public struct Rebased: Decodable, Sendable {
+		public let orphan: String
+		public let id: String
+		public let change: JSONValue
+		/// Base64 protobuf of the new change.
+		public let bytes: String
+	}
+
+	/// Hash of the base every change was rebased onto: published as `["b", base]`.
+	public let base: String
+	public let changes: [Rebased]
+}
+
+/// Everything the core's state-sync actions read for ONE object: the bases
+/// held, the changes (rebased orphans left out), the legacy checkpoint and
+/// the ids of changes this device never published.
+public struct ObjectHoldings: Sendable {
+	public var bases: [BaseRecord]
+	public var changes: [ChangeRecord]
+	public var checkpoint: CheckpointRecord?
+	public var pending: [String]
+
+	public init(bases: [BaseRecord], changes: [ChangeRecord], checkpoint: CheckpointRecord?, pending: [String] = []) {
+		self.bases = bases; self.changes = changes; self.checkpoint = checkpoint; self.pending = pending
+	}
+
+	/// Reads the object's holdings; `pending` lists the ids of unpublished changes (any object).
+	public static func load(_ store: ChangeStore, objectId: String, pending: Set<String> = []) async throws -> ObjectHoldings {
+		let changes = try await store.changesFor(objectId: objectId).filter { !$0.rebased }
+		return ObjectHoldings(
+			bases: try await store.bases(objectId: objectId),
+			changes: changes,
+			checkpoint: try await store.checkpoint(objectId: objectId),
+			pending: pending.isEmpty ? [] : changes.map(\.id).filter(pending.contains)
+		)
+	}
+
+	public var isEmpty: Bool { bases.isEmpty && changes.isEmpty && checkpoint == nil }
+
+	/// The replay memo's key for this exact input.
+	public var replayInput: ReplayInput {
+		ReplayInput(changeIds: changes.map(\.id), checkpointHash: checkpoint?.hash ?? "", baseHashes: bases.map(\.hash))
+	}
+
+	/// The current base: highest epoch, then created_at, then hash.
+	public var currentBase: BaseRecord? {
+		bases.max { $1.outranks($0) }
+	}
+
+	var payload: [String: JSONValue] {
+		var fields: [String: JSONValue] = [
+			"bases": .array(bases.map { .string($0.bytes.base64EncodedString()) }),
+			"changes": .array(changes.map(\.stateSyncJSON)),
+			"pending": .array(pending.map(JSONValue.string)),
+		]
+		if let checkpoint { fields["checkpoint"] = .string(checkpoint.bytes.base64EncodedString()) }
+		return fields
+	}
 }
 
 public struct IngestResult: Decodable, Sendable {
@@ -133,8 +225,11 @@ public struct MutationPlan: Decodable, Sendable {
 
 public enum Engine {
 	public static let changeKind = 1078
-	/// One sealed Checkpoint protobuf per object (docs/checkpoint-sync.md).
+	/// One sealed Checkpoint protobuf per object (docs/checkpoint-sync.md); retired by bases, still imported.
 	public static let checkpointKind = 1079
+	/// Addressable base of one object (docs/state-sync.md); parts 2..n ride in `basePartKind`.
+	public static let baseKind = 31078
+	public static let basePartKind = 1080
 	/// NIP-09 deletion; with `["h", spaceTag]` the space's stream (relay rule, space-vanish contract §4).
 	public static let deletionKind = 5
 
@@ -203,6 +298,25 @@ public enum Engine {
 		var payload = fields
 		payload["action"] = .string(action)
 		return try await call("sync", payload)
+	}
+
+	// ── state sync (docs/state-sync.md "Core API") ──
+
+	/// Current base state + live deltas; with no base, `replay` over every held change seeded by the checkpoint.
+	public static func replayFromBase(_ holdings: ObjectHoldings) async throws -> JSONValue? {
+		if holdings.isEmpty { return nil }
+		return try await sync("replay_from_base", holdings.payload)
+	}
+
+	public static func classify(_ holdings: ObjectHoldings) async throws -> BaseClassification {
+		try await sync("classify", holdings.payload)
+	}
+
+	/// Rebases `orphans` (hex ids; every orphan when nil) onto the current base.
+	public static func rebase(_ holdings: ObjectHoldings, orphans: [String]? = nil) async throws -> RebaseResult {
+		var payload = holdings.payload
+		if let orphans { payload["orphans"] = .array(orphans.map(JSONValue.string)) }
+		return try await sync("rebase", payload)
 	}
 
 	/// Every ledger entry plus each given `{id, channel}` stub whose channel

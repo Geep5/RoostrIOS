@@ -43,7 +43,7 @@ private final class QuerySignatures: @unchecked Sendable {
 			next.reserveCapacity(states.count)
 			var upserts: [JSONValue] = []
 			for (id, cached) in states {
-				let signature = "\(cached.input.changeDigest):\(cached.input.checkpointHash)"
+				let signature = "\(cached.input.changeDigest):\(cached.input.checkpointHash):\(cached.input.baseHashes)"
 				next[id] = signature
 				if reset || signatures[id] != signature { upserts.append(cached.state) }
 			}

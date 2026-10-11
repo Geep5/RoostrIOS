@@ -38,6 +38,8 @@ final class WebBridgeTests: XCTestCase {
 		window.__roostrReply = (id, ok, payload) => { window.__replies[id] = { ok, payload }; };
 		window.webkit.messageHandlers.roostr.postMessage({ id: 1, method: "identity", args: [] });
 		window.webkit.messageHandlers.roostr.postMessage({ id: 2, method: "nope", args: [] });
+		window.webkit.messageHandlers.roostr.postMessage({ id: 3, method: "signEvent", args: [{ kind: 1, created_at: 1760000000, tags: [], content: "hi" }] });
+		window.webkit.messageHandlers.roostr.postMessage({ id: 4, method: "signEvent", args: [{ kind: 24242, created_at: 1760000000, tags: [["t", "upload"], ["x", "ab".repeat(32)], ["expiration", "1760000600"]], content: "Upload a.txt" }] });
 		</script></body></html>
 		"""
 		try page.write(to: bundle.appendingPathComponent("200.html"), atomically: true, encoding: .utf8)
@@ -100,7 +102,47 @@ final class WebBridgeTests: XCTestCase {
 		let failure = try XCTUnwrap(unknown as? [String: Any])
 		XCTAssertEqual(failure["ok"] as? Bool, false)
 		XCTAssertEqual((failure["payload"] as? [String: Any])?["message"] as? String, "unknown bridge method nope")
+
+		let refusedValue = await eventually(webView, "window.__replies[3] || null")
+		let refused = try XCTUnwrap(refusedValue as? [String: Any])
+		XCTAssertEqual(refused["ok"] as? Bool, false)
+		XCTAssertEqual((refused["payload"] as? [String: Any])?["message"] as? String, "signEvent only signs kind 24242 (Blossom authorization), not kind 1")
+		let signedValue = await eventually(webView, "window.__replies[4] || null")
+		let signedReply = try XCTUnwrap(signedValue as? [String: Any])
+		XCTAssertEqual(signedReply["ok"] as? Bool, true)
+		let signed = try JSONDecoder().decode(NostrEvent.self, from: JSONSerialization.data(withJSONObject: try XCTUnwrap(signedReply["payload"])))
+		XCTAssertEqual(signed.kind, 24242)
+		XCTAssertEqual(signed.pubkey, host.key?.pubkey)
+		XCTAssertEqual(signed.tags, [["t", "upload"], ["x", String(repeating: "ab", count: 32)], ["expiration", "1760000600"]])
+		XCTAssertTrue(NostrKey.verify(signed), "the page gets a signed event it can put in a Blossom Authorization header")
 		bridge.detach()
+	}
+
+	/// The page may have the identity sign Blossom authorizations (kind
+	/// 24242) and nothing else: no change, base, message or deletion.
+	func testSignEventSignsOnlyBlossomAuthorization() throws {
+		let key = NostrKey.generate()
+		func template(kind: Int64, createdAt: JSONValue = .int(1_760_000_000)) -> JSONValue {
+			.object([
+				"kind": .int(kind), "created_at": createdAt, "content": .string("Upload a.txt"),
+				"tags": .array([.array([.string("t"), .string("upload")]), .array([.string("x"), .string(String(repeating: "cd", count: 32))])]),
+			])
+		}
+		let signed = try WebBridge.signEvent(template(kind: 24242), key: key)
+		XCTAssertEqual(signed.kind, 24242)
+		XCTAssertEqual(signed.created_at, 1_760_000_000)
+		XCTAssertEqual(signed.content, "Upload a.txt")
+		XCTAssertEqual(signed.pubkey, key.pubkey)
+		XCTAssertTrue(NostrKey.verify(signed))
+		let now = Int64(Date().timeIntervalSince1970)
+		let defaulted = try WebBridge.signEvent(template(kind: 24242, createdAt: .null), key: key)
+		XCTAssertLessThanOrEqual(abs(defaulted.created_at - now), 5, "created_at defaults to now")
+		for kind: Int64 in [0, 1, 5, 1059, 1078, 1079, 1080, 31078, 24241, 24243] {
+			XCTAssertThrowsError(try WebBridge.signEvent(template(kind: kind), key: key)) { error in
+				XCTAssertEqual(error as? WebBridgeError, .refused("signEvent only signs kind 24242 (Blossom authorization), not kind \(kind)"))
+			}
+		}
+		XCTAssertThrowsError(try WebBridge.signEvent(.object(["kind": .int(24242), "tags": .array([]), "content": .int(1)]), key: key))
 	}
 
 	/// Pull-to-refresh end to end: a page subscribed through "start" asks for
