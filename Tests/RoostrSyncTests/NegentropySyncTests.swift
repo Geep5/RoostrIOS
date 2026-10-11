@@ -61,6 +61,30 @@ final class NegentropySyncTests: XCTestCase {
 		XCTAssertEqual(third, [], "nothing left to fetch")
 	}
 
+	func testPassReportsReceivedAndExpectedThenResets() async throws {
+		let relay = FakeRelay()
+		try await seed(relay, notes: 3)
+		let store = try SQLiteChangeStore.inMemory()
+		let all = relay.stored.count
+
+		let first = StatusTrail()
+		_ = await sync(relay, store, statuses: first)
+		try await Task.sleep(for: .milliseconds(50))
+		let during = first.all.filter { $0.received != nil }
+		XCTAssertEqual(during.last?.received, all, "every reconciled event counted")
+		XCTAssertEqual(during.last?.expected, all, "expected sums the reconciles' missing ids")
+		XCTAssertNil(first.all.last?.received, "a finished pass reports no progress")
+
+		try await seed(relay, notes: 1)
+		let added = relay.stored.count - all
+		let second = StatusTrail()
+		_ = await sync(relay, store, statuses: second)
+		try await Task.sleep(for: .milliseconds(50))
+		let next = second.all.filter { $0.received != nil }
+		XCTAssertEqual(next.last?.received, added, "the next pass counts from zero")
+		XCTAssertEqual(next.last?.expected, added)
+	}
+
 	func testHistoryIsIncompleteUntilEveryNeededIdImports() async throws {
 		let relay = FakeRelay()
 		try await seed(relay, notes: 2)

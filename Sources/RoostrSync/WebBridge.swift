@@ -74,6 +74,8 @@ private struct BridgeStatus: Encodable {
 	let imported: Int
 	let pending: Int
 	let detail: String?
+	let received: Int?
+	let expected: Int?
 	let bootstrapped: Bool
 
 	init(_ status: SyncStatus, bootstrapped: Bool) {
@@ -81,6 +83,8 @@ private struct BridgeStatus: Encodable {
 		imported = status.imported
 		pending = status.pending
 		detail = status.detail
+		received = status.received
+		expected = status.expected
 		self.bootstrapped = bootstrapped
 	}
 }

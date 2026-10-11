@@ -132,6 +132,12 @@ public actor SyncEngine {
 	private var importedCount = 0
 	private var checkpointCount = 0
 	private var baseCount = 0
+	/// The history pass in flight: items it imported and the ids its
+	/// reconciles said are missing so far (approximate; 0 for paged walks).
+	private var pass: (received: Int, expected: Int)?
+	private var lastProgressEmit: ContinuousClock.Instant?
+	/// Progress statuses during a pass: at most two a second.
+	static let progressInterval: Duration = .milliseconds(500)
 	/// Mirror of the outbox's queued-not-in-flight count, for the status.
 	private var pendingCount = 0
 	private var queueRunning = false
@@ -400,7 +406,14 @@ public actor SyncEngine {
 
 	private func emitLiveStatus() {
 		let live = liveUp && catchingUp == 0
-		emit(SyncStatus(phase: live ? .live : .backfill, imported: importedCount, pending: pendingCount, detail: !liveUp ? nil : live ? statusDetail() : "Catching up…"))
+		lastProgressEmit = .now
+		emit(SyncStatus(phase: live ? .live : .backfill, imported: importedCount, pending: pendingCount, detail: !liveUp ? nil : live ? statusDetail() : "Catching up…",
+			received: pass?.received, expected: pass.flatMap { $0.expected > 0 ? $0.expected : nil }))
+	}
+
+	private func emitProgress() {
+		if let last = lastProgressEmit, ContinuousClock.now - last < Self.progressInterval { return }
+		emitLiveStatus()
 	}
 
 	// ── Backfill ──
@@ -453,8 +466,12 @@ public actor SyncEngine {
 		let previous = backfillChain
 		let task = Task<Result<Bool, Error>, Never> {
 			_ = await previous?.value
+			self.pass = (0, 0)
+			defer { self.pass = nil }
 			do {
-				return .success(try await self.walkHistory(since: since, resumeUntil: resumeUntil))
+				let complete = try await self.walkHistory(since: since, resumeUntil: resumeUntil)
+				if !self.stopped { self.emitLiveStatus() } // the pass's final count, unthrottled
+				return .success(complete)
 			} catch {
 				await self.recordReplayFault(1)
 				await self.persistCursor()
@@ -722,6 +739,7 @@ public actor SyncEngine {
 			lastWalkFailure = "\(relay.url): \(String(describing: error).prefix(100))"
 			return .incomplete
 		}
+		pass?.expected += need.count
 		var complete = true
 		// Checkpoint and base events run to ~40k chars each: 100 per REQ is a
 		// multi-MB burst that a slow phone link cannot drain before the relay's
@@ -814,7 +832,7 @@ public actor SyncEngine {
 			if let item = try await ingest(event) { items.append(item) }
 		}
 		try await importBatch(items, immediateNotify: true)
-		emitLiveStatus()
+		emitProgress()
 	}
 
 	// ── Event → change / checkpoint ──
@@ -898,7 +916,7 @@ public actor SyncEngine {
 			while !pending.isEmpty {
 				var refused: [ImportItem] = []
 				for item in pending {
-					if try await importOne(item, settled: &settled) { continue }
+					if try await importOne(item, settled: &settled) { pass?.received += 1; continue }
 					refused.append(item)
 				}
 				if refused.count == pending.count { break }

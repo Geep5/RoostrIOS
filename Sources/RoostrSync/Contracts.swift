@@ -302,9 +302,14 @@ public struct SyncStatus: Sendable, Equatable {
 	public var imported: Int
 	public var pending: Int
 	public var detail: String?
+	/// Items (changes, bases, checkpoints) imported by the history pass in flight; nil between passes.
+	public var received: Int?
+	/// Ids the pass's reconciles said are missing so far (approximate, may grow); nil when unknown.
+	public var expected: Int?
 
-	public init(phase: SyncPhase, imported: Int = 0, pending: Int = 0, detail: String? = nil) {
+	public init(phase: SyncPhase, imported: Int = 0, pending: Int = 0, detail: String? = nil, received: Int? = nil, expected: Int? = nil) {
 		self.phase = phase; self.imported = imported; self.pending = pending; self.detail = detail
+		self.received = received; self.expected = expected
 	}
 }
 
