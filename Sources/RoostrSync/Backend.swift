@@ -574,7 +574,9 @@ public actor Backend {
 	/// The states a mutation plans over. The planner reads blocks only of the
 	/// objects its params name (targets, senders, recipients); every other
 	/// state goes without its blocks, which are most of a vault's bytes and
-	/// would overrun the core's per-request arena on a large one.
+	/// would overrun the core's per-request arena on a large one. Image icons
+	/// (`iconImage` data URLs, up to 16 KB each) go too: the planner never
+	/// reads them, and thousands of them crashed the core on an imported vault.
 	static func mutationObjects(_ states: [JSONValue], params: JSONValue) -> [JSONValue] {
 		var named: Set<String> = []
 		func collect(_ value: JSONValue) {
@@ -587,11 +589,15 @@ public actor Backend {
 		}
 		collect(params)
 		return states.map { state in
-			guard case .object(var fields) = state, let id = fields["id"]?.string, !named.contains(id), fields["blocks"] != nil else {
+			guard case .object(var object) = state, let id = object["id"]?.string, !named.contains(id) else {
 				return packCoreValueMaps(state)
 			}
-			fields["blocks"] = .array([])
-			return packCoreValueMaps(.object(fields))
+			if object["blocks"] != nil { object["blocks"] = .array([]) }
+			if case .object(var fields)? = object["fields"], fields["iconImage"] != nil {
+				fields["iconImage"] = nil
+				object["fields"] = .object(fields)
+			}
+			return packCoreValueMaps(.object(object))
 		}
 	}
 

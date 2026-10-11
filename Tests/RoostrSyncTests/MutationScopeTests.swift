@@ -52,4 +52,30 @@ final class MutationScopeTests: XCTestCase {
 		XCTAssertEqual(withScope.changes, reference.changes)
 		XCTAssertEqual(withScope.result, reference.result)
 	}
+
+	/// ~2,000 imported bookmarks with inline image icons crashed the core; the
+	/// planner never reads other objects' icons, so they stay out of the request.
+	func testUnrelatedImageIconsStayOutOfThePlan() async throws {
+		let backend = Backend(key: NostrKey.generate(), relays: [], store: InMemoryChangeStore())
+		let target = try await backend.createNote(name: "Target", text: "first")
+		let other = try await backend.createNote(name: "Other", text: "seed")
+		try await backend.ensure()
+		let states = await backend.states
+		let icon: JSONValue = .object(["stringValue": .string("data:image/png;base64," + String(repeating: "A", count: 16_000))])
+		guard case .object(var named) = try XCTUnwrap(states[target]?.state), case .object(var namedFields) = named["fields"] ?? .null,
+		      case .object(let otherState) = try XCTUnwrap(states[other]?.state), case .object(let otherFields) = otherState["fields"] ?? .null else { return XCTFail("note shape") }
+		namedFields["iconImage"] = icon
+		named["fields"] = .object(namedFields)
+		let many: [JSONValue] = (0..<2_000).map { i in
+			var o = otherState
+			var f = otherFields
+			f["iconImage"] = icon
+			o["id"] = .string("icon-\(i)")
+			o["fields"] = .object(f)
+			return .object(o)
+		}
+		let scoped = Backend.mutationObjects([.object(named)] + many, params: .object(["object_id": .string(target)]))
+		XCTAssertLessThan(try JSONEncoder().encode(scoped).count, 2_000_000, "unrelated icons stay out")
+		XCTAssertEqual(scoped.first { $0["id"]?.string == target }, packCoreValueMaps(.object(named)), "the named object keeps its icon")
+	}
 }
