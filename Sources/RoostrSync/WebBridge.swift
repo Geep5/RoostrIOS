@@ -482,6 +482,16 @@ extension WebBridge: WKUIDelegate {
 		guard present(alert, from: webView) else { return completionHandler(nil) }
 	}
 
+	/// A link the page opens in a new window (`target=_blank`, `window.open`):
+	/// the user's default browser, never a second web view. WebKit dropped
+	/// these silently without this, so a link in a page did nothing.
+	public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+		if let url = navigationAction.request.url, let scheme = url.scheme?.lowercased(), ["http", "https", "mailto", "tel"].contains(scheme) {
+			UIApplication.shared.open(url)
+		}
+		return nil
+	}
+
 	/// Presents over whatever is frontmost; false when nothing can present (WebKit must still get an answer).
 	private func present(_ alert: UIAlertController, from webView: WKWebView) -> Bool {
 		var top = webView.window?.rootViewController
