@@ -232,11 +232,21 @@ public actor Backend {
 	// ── Replayed state ──
 
 	/// Recomputes dirty object states; an object whose replay input did not change keeps its cached replay.
+	///
+	/// A read waits for the pass already running and at most one more, which
+	/// covers everything dirtied before the read was made. Objects a catch-up
+	/// imports while it waits are the next read's: looping until nothing was
+	/// dirty held every read - the page's first lists included - for as long as
+	/// the imports kept coming. Their commit notifications re-read them.
 	func ensure() async throws {
+		// The running pass may have taken its ids before this read's changes landed.
+		if let rebuilding { try await rebuilding.value }
+		// A pass started since then took them (only a pass empties `dirty`): join it.
 		if let rebuilding { return try await rebuilding.value }
+		guard allDirty || !dirty.isEmpty else { return }
 		let work = Task {
 			defer { rebuilding = nil }
-			repeat { try await rebuildStates() } while allDirty || !dirty.isEmpty
+			try await rebuildStates()
 		}
 		rebuilding = work
 		try await work.value

@@ -156,4 +156,43 @@ final class ReplayCacheTests: XCTestCase {
 			XCTAssertEqual(inputs[id], ReplayInput(changeIds: changes.map(\.id), checkpointHash: ""), id)
 		}
 	}
+
+	/// A catch-up keeps marking objects changed while the page reads. A read
+	/// serves everything changed before it was made, and never waits for the
+	/// imports to go quiet - that held "Opening your vault…" for the whole
+	/// catch-up on every reopen.
+	func testReadIsNotHeldByObjectsChangedWhileItWaits() async throws {
+		let store = try SQLiteChangeStore.inMemory()
+		let seed = try await seeded(store)
+		let reader = backend(store)
+		try await reader.ensure()
+		try await appendRename(store, seed.first, to: "Renamed")
+		await reader.markImported([seed.first])
+		let churn = Task {
+			while !Task.isCancelled {
+				await reader.markImported([seed.second])
+				await Task.yield()
+			}
+		}
+		// Ends the churn if the read is still waiting, so a regression fails instead of hanging.
+		let watchdog = Task {
+			try? await Task.sleep(for: .seconds(5))
+			churn.cancel()
+		}
+		let clock = ContinuousClock()
+		let started = clock.now
+		let renamed = try await name(reader, seed.first)
+		let waited = clock.now - started
+		watchdog.cancel()
+		churn.cancel()
+		XCTAssertEqual(renamed, "Renamed", "a change made before the read is in it")
+		XCTAssertLessThan(waited, .seconds(5), "the read waited for the imports to stop")
+	}
+}
+
+private extension Backend {
+	/// What a relay import does to the replay set, without the notification fan-out.
+	func markImported(_ ids: [String]) {
+		for id in ids { dirty.insert(id) }
+	}
 }
