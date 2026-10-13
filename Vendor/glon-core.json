@@ -7,9 +7,9 @@
     "ios-arm64-simulator",
     "macos-arm64"
   ],
-  "sourceFingerprint": "5137f37eb78c03992a4f609516c2f33e48c55d2a3592c1af9de86d2e4795ade4",
+  "sourceFingerprint": "438294e6ee7ab10dbb0784f027b621c6d6e75f2c6c708778575dfffbe24a2d7d",
   "sourceFiles": {
-    "abi/abi.odin": "8c81cc5b058d4b764a649591a4061586fcd9471e7997ec73a6a48d918b81ca28",
+    "abi/abi.odin": "34d035764a9dabadcd1a6ad474a36c27ba2a3a39d32273375af93e2d316b3507",
     "core/agent_message.odin": "b044ff123c05f19a4110961b02d02a0f289b27d88bfa729e398c72a4a39d1b23",
     "core/agent_serving.odin": "aa87a7027f2582434c3039ccb2c30f24258344dc91141164f0939382ef5ac114",
     "core/authority.odin": "e14c858ba1e309b96c165bd6fa91858e5cfe65019a3a58a223196b292c5a54fd",
