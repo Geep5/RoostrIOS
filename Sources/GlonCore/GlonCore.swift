@@ -19,7 +19,7 @@ public actor GlonCore {
 	/// `sourceFingerprint` of Vendor/glon-core.json: the Odin sources the
 	/// linked framework was built from. Persisted engine output (the replay
 	/// cache) is keyed on it; `VendorFingerprintTests` keeps it in step with the vendored framework.
-	public static let sourceFingerprint = "c4fe7e038fd7d9ce85995a7d11d5a56f914a3d153ac5915611c942e4392b7825"
+	public static let sourceFingerprint = "9b02f1750a36b8c66067c0a0cf2c7deee94f336af86cd0bb418f1934d8b78f2c"
 	public static let requestLimit = 16 * 1024 * 1024
 	/// `abi.odin BLOB_LIMIT`: the binary side-channel of one request.
 	public static let blobLimit = 32 * 1024 * 1024
