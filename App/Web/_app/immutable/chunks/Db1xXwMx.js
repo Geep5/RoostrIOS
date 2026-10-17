@@ -1,0 +1,1 @@
+import"./BK2ac_7R.js";import{a as e}from"./DF1E9qf7.js";var t={get data(){return e.data},get error(){return e.error},get form(){return e.form},get params(){return e.params},get route(){return e.route},get state(){return e.state},get status(){return e.status},get url(){return e.url}};export{t};
