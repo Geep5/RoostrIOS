@@ -351,6 +351,7 @@ extension Backend {
 	public func channels() async throws -> [JSONValue] {
 		try await ensure()
 		let keys = try keyring.all()
+		let pins = pinsBySpace()
 		var spaces: [(createdAt: Int64, id: String, json: JSONValue)] = []
 		for (id, cached) in states {
 			let state = cached.state
@@ -362,7 +363,7 @@ extension Backend {
 				"name": .string(fields?["name"]?["stringValue"]?.string ?? ""),
 				// An image icon (link or upload) wins over an emoji, as on the web and the daemon.
 				"icon": .string([fields?["iconImage"]?["stringValue"]?.string, fields?["iconEmoji"]?["stringValue"]?.string].compactMap { $0 }.first { !$0.isEmpty } ?? ""),
-				"pinnedIds": .array((fields?["pinnedIds"]?["valuesValue"]?["items"]?.array ?? []).compactMap { $0["stringValue"]?.string }.filter { !$0.isEmpty }.map(JSONValue.string)),
+				"pinnedIds": .array((pins[id] ?? []).map(JSONValue.string)),
 				"members": .array(Self.members(of: state).map { .object(["npub": .string($0.npub), "role": .string($0.role)]) }),
 				"keyId": .int(fields?["keyId"]?["intValue"]?.int ?? 1),
 				"createdAt": .int(createdAt),
@@ -374,6 +375,24 @@ extension Backend {
 		}
 		spaces.sort { $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id < $1.id }
 		return spaces.map(\.json)
+	}
+
+	/// Pinned object ids per space, in sidebar order. Each pinned object
+	/// carries its own position (`pin_order`, a sortable key), so edits from
+	/// different devices to different pins all survive; an object with no
+	/// space belongs to the oldest one. core/pins.odin builds the same list.
+	func pinsBySpace() -> [String: [String]] {
+		var live: [(id: String, state: JSONValue)] = []
+		for (id, cached) in states where !(cached.state["deleted"]?.bool ?? false) { live.append((id, cached.state)) }
+		let fallback = live.filter { $0.state["typeKey"]?.string == "channel" }
+			.min { ($0.state["createdAt"]?.int ?? 0, $0.id) < ($1.state["createdAt"]?.int ?? 0, $1.id) }?.id ?? ""
+		var bySpace: [String: [(id: String, key: String)]] = [:]
+		for (id, state) in live {
+			guard let key = state["fields"]?["pin_order"]?["stringValue"]?.string, !key.isEmpty else { continue }
+			let channel = state["fields"]?["channel"]?["stringValue"]?.string ?? ""
+			bySpace[channel.isEmpty ? fallback : channel, default: []].append((id, key))
+		}
+		return bySpace.mapValues { $0.sorted { $0.key != $1.key ? $0.key < $1.key : $0.id < $1.id }.map(\.id) }
 	}
 
 	/// The administrator of a space as the UI shows it, from its keyring
