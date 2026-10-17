@@ -99,8 +99,8 @@ private func items(_ fields: JSONValue?, _ key: String) -> [JSONValue] {
 }
 
 extension Backend {
-	/// The Odin server's GET /api/objects summary exclusions, verbatim.
-	static let hiddenListTypes: Set<String> = ["program", "typescript", "json", "proto", "relation", "channel", "skill", "peer", "pinned_fact", "milestone", "descriptor", "install", "vanish_log", "user_prefs"]
+	/// The Odin server's GET /api/objects summary exclusions, verbatim: engine internals only.
+	static let hiddenListTypes: Set<String> = ["program", "typescript", "json", "proto", "peer", "pinned_fact", "milestone", "vanish_log", "user_prefs", "descriptor", "install", "set", ""]
 
 	/// `fetchObjects`: website `ObjectSummary[]`, newest first.
 	public func summaries() async throws -> [JSONValue] {
