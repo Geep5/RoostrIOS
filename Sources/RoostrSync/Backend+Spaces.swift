@@ -358,7 +358,7 @@ extension Backend {
 			guard state["typeKey"]?.string == "channel", !(state["deleted"]?.bool ?? false) else { continue }
 			let fields = state["fields"]
 			let createdAt = state["createdAt"]?.int ?? 0
-			var json: [String: JSONValue] = [
+			let json: [String: JSONValue] = [
 				"id": .string(id),
 				"name": .string(fields?["name"]?["stringValue"]?.string ?? ""),
 				// An image icon (link or upload) wins over an emoji, as on the web and the daemon.
@@ -369,8 +369,6 @@ extension Backend {
 				"createdAt": .int(createdAt),
 				"owner": .string(spaceOwner(keys[id])),
 			]
-			// Display order for the rail; absent means "use createdAt".
-			if let order = fields?["order"]?["floatValue"] ?? fields?["order"]?["intValue"] { json["order"] = order }
 			spaces.append((createdAt, id, .object(json)))
 		}
 		spaces.sort { $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id < $1.id }
