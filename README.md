@@ -79,7 +79,9 @@ space keys.
 - The keyboard comes up as in the iOS web view: for a tap on a field, not for
   a field the app focuses by itself (the chat composer when a page opens
   stays focused, keyboard down, until tapped). Return acts as Enter (splits a
-  block, sends a message, confirms a field). Dismissing the keyboard ends
+  block, sends a message, confirms a field); delete at the start of a block
+  acts as Backspace (a to-do, list item or heading becomes a paragraph, a
+  paragraph joins the block above). Dismissing the keyboard ends
   editing, so a block edited on another device then shows the change. No
   hover state or tooltip outlives a tap. See the gpui README's iOS section.
 - Text fields and the editor have iOS's edit menu, as in the web view: press
