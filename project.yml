@@ -1,5 +1,8 @@
-# XcodeGen spec for the app shell: `brew install xcodegen && xcodegen` writes
-# Roostr.xcodeproj (gitignored). The engine bridge is the local Swift package.
+# XcodeGen spec for the app host: `brew install xcodegen && xcodegen` writes
+# Roostr.xcodeproj (gitignored). The app itself is Rust: Scripts/build-rust.sh
+# builds `roostr-ios` from the sibling RoostrWebsite repository's GPUI
+# workspace (../RoostrWebsite/gpui, or ROOSTR_GPUI_DIR) and App/main.c hands
+# the process to it.
 #
 # Signing: automatic under the Roostr developer team (58GKGS43UM); edit here
 # to build under another account.
@@ -14,35 +17,45 @@ settings:
     DEVELOPMENT_TEAM: 58GKGS43UM
     CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "40"
-packages:
-  RoostrIOS:
-    path: .
+    CURRENT_PROJECT_VERSION: "41"
 targets:
   Roostr:
     type: application
     platform: iOS
     sources:
-      - path: App
-        excludes: [Web]
-      # The website's static build (Scripts/build-web.sh), served by RoostrSchemeHandler as roostr://app/.
-      - path: App/Web
-        type: folder
-        buildPhase: resources
-    dependencies:
-      - package: RoostrIOS
-        product: RoostrUI
-      - sdk: WebKit.framework
+      - path: App/main.c
+      - path: App/Assets.xcassets
+      - path: App/PrivacyInfo.xcprivacy
+    preBuildScripts:
+      - name: Build Rust (roostr-ios)
+        script: '"$SRCROOT/Scripts/build-rust.sh"'
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/rust/libroostr_ios.a
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Roostr
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        UILaunchScreen: {}
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        # GPUI's UIKit platform runs one window scene with its own delegate
+        # classes (gpui-pre-ios); UIKit may restore the scene by class name.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: GPUIIosSceneDelegate
+        UIStatusBarStyle: UIStatusBarStyleLightContent
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         # iPad multitasking requires every orientation.
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        # roostr://app/<web path> opens that page (roostr://app/app/object/<id>).
+        CFBundleURLTypes:
+          - CFBundleURLName: app.roostr.Roostr
+            CFBundleURLSchemes: [roostr]
         # Export compliance is answered in App Store Connect (NIP-44 is standard
         # encryption); an ITSAppUsesNonExemptEncryption key would need the
         # compliance code that answer produces, so it is deliberately absent.
@@ -50,25 +63,29 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.roostr.Roostr
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        SWIFT_VERSION: "5.10"
         TARGETED_DEVICE_FAMILY: "1,2"
-  RoostrUITests:
-    type: bundle.ui-testing
-    platform: iOS
-    sources: [AppUITests]
-    dependencies:
-      - target: Roostr
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.roostr.RoostrUITests
-        TEST_TARGET_NAME: Roostr
-        GENERATE_INFOPLIST_FILE: YES
+        LIBRARY_SEARCH_PATHS: $(DERIVED_FILE_DIR)/rust
+        # The Rust library's system dependencies (`cargo rustc -p roostr-ios
+        # --crate-type staticlib -- --print native-static-libs`).
+        OTHER_LDFLAGS:
+          - -lroostr_ios
+          - -liconv
+          - -framework CoreFoundation
+          - -framework CoreGraphics
+          - -framework CoreText
+          - -framework CoreVideo
+          - -framework Foundation
+          - -framework Metal
+          - -framework Network
+          - -framework QuartzCore
+          - -framework SafariServices
+          - -framework Security
+          - -framework UIKit
+          - -framework UserNotifications
+        DEAD_CODE_STRIPPING: YES
 schemes:
   Roostr:
     build:
-      targets: { Roostr: all, RoostrUITests: [test] }
+      targets: { Roostr: all }
     run:
       config: Debug
-    test:
-      config: Debug
-      targets: [RoostrUITests]

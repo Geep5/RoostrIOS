@@ -1,4 +1,0 @@
-module Glon {
-	header "glon.h"
-	export *
-}

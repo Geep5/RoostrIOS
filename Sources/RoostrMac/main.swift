@@ -1,3 +1,0 @@
-import RoostrUI
-
-RoostrApp.main()

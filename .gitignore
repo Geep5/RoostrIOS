@@ -1,8 +1,5 @@
-.build/
-.swiftpm/
 DerivedData/
 *.xcodeproj
 xcuserdata/
 App/Info.plist
-Vendor/.glon-*
 .DS_Store

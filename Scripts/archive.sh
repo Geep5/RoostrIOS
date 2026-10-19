@@ -6,8 +6,8 @@
 #
 # Requires: Xcode signed in to the developer account (Xcode > Settings >
 # Accounts) so automatic signing can create certificates and profiles
-# (-allowProvisioningUpdates), the web bundle built (Scripts/build-web.sh),
-# and the project generated (xcodegen).
+# (-allowProvisioningUpdates), and what Scripts/build-rust.sh needs (Rust
+# with the aarch64-apple-ios target, Odin, ../RoostrWebsite and ../glonOdin).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,7 +34,6 @@ EOF
 # Export signs with the App Store distribution profile, which needs no device.
 xcodebuild -project "$root/Roostr.xcodeproj" -scheme Roostr -configuration Release \
 	-destination 'generic/platform=iOS' -archivePath "$archive" -derivedDataPath "$out/DerivedData" \
-	-skipPackagePluginValidation -skipMacroValidation \
 	CODE_SIGN_STYLE=Manual CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= PROVISIONING_PROFILE_SPECIFIER= archive
 xcodebuild -exportArchive -archivePath "$archive" -exportPath "$out/export" \
 	-exportOptionsPlist "$out/ExportOptions.plist" -allowProvisioningUpdates
