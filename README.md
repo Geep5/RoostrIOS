@@ -82,6 +82,12 @@ space keys.
   block, sends a message, confirms a field). Dismissing the keyboard ends
   editing, so a block edited on another device then shows the change. No
   hover state or tooltip outlives a tap. See the gpui README's iOS section.
+- Text fields and the editor have iOS's edit menu, as in the web view: press
+  and hold in the field being edited (the caret goes under the finger) and
+  lift, or tap where the caret already is, or tap the selection. Paste goes
+  where ⌘V goes, so a pasted link offers Bookmark / Link / Text (and Embed);
+  a hardware keyboard's ⌘X ⌘C ⌘V ⌘A work too. A hold on a block that is not
+  being edited (or on the edited block's handle) still lifts it.
 - Sync reconnects without a relaunch: returning from the background, a
   network path change (Wi-Fi ⇄ cellular, back online), pulling the mobile
   page down and tapping the mobile sync dot all call `ReplicaBackend::resume`.
