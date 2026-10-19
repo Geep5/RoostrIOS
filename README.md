@@ -93,6 +93,11 @@ space keys.
 - Sync reconnects without a relaunch: returning from the background, a
   network path change (Wi-Fi ⇄ cellular, back online), pulling the mobile
   page down and tapping the mobile sync dot all call `ReplicaBackend::resume`.
+  A fresh install holds everything the browser shows: besides the window
+  each stream is read from (its newest base minus a day), it fetches once
+  the older history of every object no computer has based yet (an install
+  that synced before build 46 catches up on its next pass, no sign-out).
+  Pinned widgets refresh as objects sync in.
 - Reminders: the phone runs no scheduler and no agents. After each burst of
   commits it mirrors every recurring object's next occurrence
   (`repeat.next`) into pending local notifications - the soonest 64 - and
