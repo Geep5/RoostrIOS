@@ -3,3 +3,4 @@ DerivedData/
 xcuserdata/
 App/Info.plist
 .DS_Store
+.build/
