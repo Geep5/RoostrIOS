@@ -17,7 +17,7 @@ settings:
     DEVELOPMENT_TEAM: 58GKGS43UM
     CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "41"
+    CURRENT_PROJECT_VERSION: "42"
 targets:
   Roostr:
     type: application
@@ -41,7 +41,8 @@ targets:
         UILaunchScreen:
           UIColorName: LaunchBackground
         # GPUI's UIKit platform runs one window scene with its own delegate
-        # classes (gpui-pre-ios); UIKit may restore the scene by class name.
+        # classes (gpui-pre-ios); UIKit may restore the scene by class name,
+        # including the Swift app's SwiftUI delegate, which GPUI takes over.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations:

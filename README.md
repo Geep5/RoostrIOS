@@ -62,6 +62,10 @@ one keeps its identity and vault:
   engine are ignored and rebuilt. Invite and join-request bookkeeping the
   Swift app kept in the store's meta rows is not carried over (it lives in
   `local.json` now) and starts empty.
+- Window scene: iOS restores the Swift app's scene session, which names
+  SwiftUI's scene delegate; GPUI's UIKit platform takes that scene over at
+  launch (vendored gpui-pre-ios, `sceneWillConnect:`), as SwiftUI's delegate
+  alone shows a black screen and crashes when the app is backgrounded.
 
 Logging out (Settings → "Log out on this device") is refused while changes
 are unpublished; it then erases the replica and forgets the identity and

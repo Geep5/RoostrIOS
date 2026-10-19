@@ -38,4 +38,5 @@ xcodebuild -project "$root/Roostr.xcodeproj" -scheme Roostr -configuration Relea
 xcodebuild -exportArchive -archivePath "$archive" -exportPath "$out/export" \
 	-exportOptionsPlist "$out/ExportOptions.plist" -allowProvisioningUpdates
 echo "archive: $archive"
-ls "$out/export"
+# An upload leaves no export directory.
+[[ "${1:-}" == "--upload" ]] || ls "$out/export"
