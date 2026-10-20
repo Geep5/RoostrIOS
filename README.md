@@ -84,6 +84,10 @@ space keys.
   paragraph joins the block above). Dismissing the keyboard ends
   editing, so a block edited on another device then shows the change. No
   hover state or tooltip outlives a tap. See the gpui README's iOS section.
+- A chat opens addressed, as in the web view: the composer starts as
+  `@Agent ` (the agent last tagged there, an agent's own page, or the
+  object's only agent), in the chat sheet and the full-screen chat alike, so
+  a plain message reaches the agent.
 - Text fields and the editor have iOS's edit menu, as in the web view: press
   and hold in the field being edited (the caret goes under the finger) and
   lift, or tap where the caret already is, or tap the selection. Paste goes
