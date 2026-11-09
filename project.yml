@@ -1,6 +1,6 @@
 # XcodeGen spec for the app host: `brew install xcodegen && xcodegen` writes
 # Roostr.xcodeproj (gitignored). The app itself is Rust: Scripts/build-rust.sh
-# builds `roostr-ios` from the sibling RoostrWebsite repository's GPUI
+# builds `roostr-ios` from the sibling RoostrWebsite repository's Rune
 # workspace (../RoostrWebsite/gpui, or ROOSTR_GPUI_DIR) and App/main.c hands
 # the process to it.
 #
@@ -40,15 +40,16 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
           UIColorName: LaunchBackground
-        # GPUI's UIKit platform runs one window scene with its own delegate
-        # classes (gpui-pre-ios); UIKit may restore the scene by class name,
-        # including the Swift app's SwiftUI delegate, which GPUI takes over.
+        # Roostr runs one window scene with its own delegate classes
+        # (roostr-ios `app.rs`); UIKit may restore the scene by class name,
+        # including the Swift app's SwiftUI delegate or the GPUI build's
+        # GPUIIosSceneDelegate, which Roostr takes over.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations:
             UIWindowSceneSessionRoleApplication:
               - UISceneConfigurationName: Default Configuration
-                UISceneDelegateClassName: GPUIIosSceneDelegate
+                UISceneDelegateClassName: RoostrSceneDelegate
         UIStatusBarStyle: UIStatusBarStyleLightContent
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         # iPad multitasking requires every orientation.

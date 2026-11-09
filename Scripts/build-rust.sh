@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xcode's pre-build step: builds the app itself - the `roostr-ios` static
-# library from the sibling RoostrWebsite repository's GPUI workspace - for the
+# library from the sibling RoostrWebsite repository's Rune workspace - for the
 # platform Xcode is building, and copies it to $DERIVED_FILE_DIR/rust, where
 # the target links it from. Debug → cargo's dev profile (line tables only and
 # no incremental cache, to keep the build small), Release → --release.
